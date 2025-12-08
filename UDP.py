@@ -21,4 +21,5 @@ def udp_server(ip="0.0.0.0", port=1234):
         except:
             print("Données :", data.decode())
 
-udp_server()
+udp_server() 
+# 
