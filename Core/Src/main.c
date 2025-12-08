@@ -20,7 +20,6 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
-extern struct netif gnetif;
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -436,7 +435,7 @@ void send_presence_broadcast(void)
     }
 
     // Broadcast global (ça marche bien avec ton PC en 169.254.x.x)
-    ipaddr_aton("169.254.90.70", &dest_ip);
+    ipaddr_aton("192.168.1.41", &dest_ip);
 
     // Bind sur n'importe quelle IP / n'importe quel port
     udp_bind(pcb, IP_ADDR_ANY, 0);
@@ -445,7 +444,7 @@ void send_presence_broadcast(void)
     char json[256];
 
     // IMPORTANT : mettre l'IP réelle de la carte
-    const char *device_ip = "169.254.90.200";
+    const char *device_ip = "192.168.001.185";
 
     snprintf(json, sizeof(json),
         "{ \"type\": \"presence\", \"id\": \"nucleo-01\", \"ip\": \"%s\", \"timestamp\": \"2025-10-02T08:20:00Z\" }",
