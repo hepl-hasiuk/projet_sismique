@@ -6,7 +6,7 @@ print("PYTHON EXE =", sys.executable)
 import socket
 import json
 
-def udp_server(ip="0.0.0.0", port=1234):
+def udp_server(ip="0.0.0.0", port=12345):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((ip, port))
     print(f"Serveur UDP en écoute sur {ip}:{port}")
@@ -21,5 +21,4 @@ def udp_server(ip="0.0.0.0", port=1234):
         except:
             print("Données :", data.decode())
 
-udp_server() 
-# 
+udp_server()
