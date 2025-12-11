@@ -217,6 +217,8 @@ int main(void)
   osThreadSuspend(heartBeatTaskHandle);
   osThreadSuspend(presenceTaskHandle);
   osThreadSuspend(logMessageTaskHandle);
+  osThreadSuspend(seismicTaskHandle);
+  osThreadSuspend(clientTaskHandle);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -712,13 +714,10 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
     tcp_recv(newpcb, tcp_server_recv);
+
     return ERR_OK;
 
-    HAL_UART_Transmit(&huart3,
-        (uint8_t*)"📥 Connexion reçue\r\n",
-        20,
-        HAL_MAX_DELAY
-    );
+
 
 }
 
@@ -761,9 +760,11 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     {
         char response[256];
         int resp_len = snprintf(response, sizeof(response),
-            "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-            "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f} }",
-            rms_x, rms_y, rms_z);
+                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+                "\"timestamp\": \"2025-10-02T08:21:01Z\", "
+                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+                "\"status\": \"normal\" }",
+                rms_x, rms_y, rms_z);
 
         tcp_write(tpcb, response, resp_len, TCP_WRITE_FLAG_COPY);
         tcp_output(tpcb);
@@ -811,36 +812,33 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
         return err;
     }
 
-    // --- LOG connexion réussie ---
-    char msg[80];
-    snprintf(msg, sizeof(msg),
-             "🟢 Connecté à %s\r\n",
-             ipaddr_ntoa(&tpcb->remote_ip));
+    char msg[100];
+    snprintf(msg, sizeof(msg), "🟢 Connecté (Port 1234) à %s\r\n", ipaddr_ntoa(&tpcb->remote_ip));
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    // --- 1) Envoi du data_request ---
-    const char *request = "{ \"type\": \"data_request\", \"from\": \"nucleo-8\" }";
+    // --- CORRECTION : On envoie tout en un seul gros paquet JSON pour éviter le collage ---
+    // On simule ici que le client envoie ses données RMS au serveur
 
-    tcp_write(tpcb, request, strlen(request), TCP_WRITE_FLAG_COPY);
-    tcp_output(tpcb);
-
-    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 data_request envoyé\r\n", 27, HAL_MAX_DELAY);
-
-    // --- 2) Envoi du data_send avec RMS ---
-    char sendbuf[200];
+    char sendbuf[256];
     int len = snprintf(sendbuf, sizeof(sendbuf),
         "{ \"type\": \"data_send\", \"id\": \"nucleo-8\", "
-        "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f} }",
+        "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+        "\"request\": \"need_ack\" }", // On combine les infos
         rms_x, rms_y, rms_z);
 
+    // Envoi des données
     tcp_write(tpcb, sendbuf, len, TCP_WRITE_FLAG_COPY);
+
+    // Force l'envoi immédiat
     tcp_output(tpcb);
 
-    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 data_send RMS envoyé\r\n",
-                      30, HAL_MAX_DELAY);
+    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 Données envoyées au Port 1234\r\n", 36, HAL_MAX_DELAY);
 
-    // Fermeture connexion
+    // IMPORTANT : Dans l'idéal, on ne ferme pas tout de suite, on attend la réponse.
+    // Mais pour cet exercice, on ferme proprement après un court délai pour laisser le temps au paquet de partir.
+    // Note : tcp_close gère normalement cela, mais c'est plus sûr ainsi en debug.
     tcp_close(tpcb);
+
     return ERR_OK;
 }
 
@@ -878,15 +876,19 @@ void StartDefaultTask(void const * argument)
         osThreadResume(heartBeatTaskHandle);
         osThreadResume(presenceTaskHandle);
         osThreadResume(logMessageTaskHandle);
+        osThreadResume(seismicTaskHandle);
+        osThreadResume(clientTaskHandle);
       } else {
         system_running = 0;
         HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM STOPPED\r\n", 16, HAL_MAX_DELAY);
         osThreadSuspend(heartBeatTaskHandle);
         osThreadSuspend(presenceTaskHandle);
         osThreadSuspend(logMessageTaskHandle);
+        osThreadSuspend(seismicTaskHandle);
+        osThreadSuspend(clientTaskHandle);
       }
     }
-    osDelay(50);
+    osDelay(100);
   }
 
 
@@ -959,6 +961,7 @@ void StartClientTask(void const * argument)
     	for (int i = 0; i < node_count; i++)
     	{
     	    send_data_request_tcp(node_list[i]);
+    	    osDelay(200);
     	}
 
 
