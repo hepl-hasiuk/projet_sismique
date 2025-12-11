@@ -20,7 +20,6 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
-
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lwip/udp.h"
@@ -28,6 +27,9 @@
 #include "lwip/ip_addr.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include "lwip/tcp.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,11 +50,8 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
-
 RTC_HandleTypeDef hrtc;
-
 TIM_HandleTypeDef htim2;
-
 UART_HandleTypeDef huart3;
 
 osThreadId defaultTaskHandle;
@@ -63,10 +62,20 @@ osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
-#define PRESENCE_PORT 12345 // même port que ton script Python
-
+#define PRESENCE_PORT 1234 // même port que ton script Python
+#define WINDOW_SIZE 100
 osThreadId presenceTaskHandle; // handle de la tâche de présence
 uint16_t adc_raw[3];
+//seismic
+osThreadId seismicTaskHandle;
+float avg_x = 0, avg_y = 0, avg_z = 0;
+float rms_x = 0, rms_y = 0, rms_z = 0;
+float buf_x[WINDOW_SIZE];
+float buf_y[WINDOW_SIZE];
+float buf_z[WINDOW_SIZE];
+uint16_t idx = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,6 +95,19 @@ void StartHeartBeatTask(void const * argument);
 /* USER CODE BEGIN PFP */
 void StartPresenceTask(void const * argument);
 void send_presence_broadcast(void);
+void StartSeismicTask(void const * argument);
+
+
+
+
+
+void tcp_server_init(void);
+err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
+err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
+
+void send_data_request_tcp(const char *ip);
+err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -184,6 +206,12 @@ int main(void)
   osThreadDef(presenceTask, StartPresenceTask, osPriorityBelowNormal, 0, 256);
   presenceTaskHandle = osThreadCreate(osThread(presenceTask), NULL);
   /* add threads, ... */
+
+
+  /* definition and creation of seismicTask */
+  osThreadDef(seismicTask, StartSeismicTask, osPriorityAboveNormal, 0, 512);
+  seismicTaskHandle = osThreadCreate(osThread(seismicTask), NULL);
+
 
   /* 🚨 IMPORTANT : tout suspendre au début */
   osThreadSuspend(heartBeatTaskHandle);
@@ -409,7 +437,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 2399;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 999;
+  htim2.Init.Period = 99;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -554,6 +582,8 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+
 void StartPresenceTask(void const * argument)
 {
   /* On attend que LwIP soit initialisé */
@@ -568,6 +598,7 @@ void StartPresenceTask(void const * argument)
     osDelay(10000); // toutes les 1 seconde
   }
 }
+
 
 void send_presence_broadcast(void)
 {
@@ -611,7 +642,7 @@ void send_presence_broadcast(void)
   pbuf_free(p);
   udp_remove(pcb);
 
-  // Tu peux éventuellement afficher err via UART si tu veux debug
+  //  éventuellement afficher err via UART si tu veux debug
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
@@ -620,6 +651,201 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
   }
 }
+
+void StartSeismicTask(void const * argument)
+{
+    memset(buf_x, 0, sizeof(buf_x));
+    memset(buf_y, 0, sizeof(buf_y));
+    memset(buf_z, 0, sizeof(buf_z));
+
+    for(;;)
+    {
+        // 1) Lire valeurs brutes
+        float x = adc_raw[0];
+        float y = adc_raw[1];
+        float z = adc_raw[2];
+
+        // 2) Moyenne glissante simple
+        avg_x = 0.9f * avg_x + 0.1f * x;
+        avg_y = 0.9f * avg_y + 0.1f * y;
+        avg_z = 0.9f * avg_z + 0.1f * z;
+
+        // 3) RMS sur 1 seconde (100 échantillons)
+        buf_x[idx] = avg_x;
+        buf_y[idx] = avg_y;
+        buf_z[idx] = avg_z;
+
+        float sumx = 0, sumy = 0, sumz = 0;
+        for(int i = 0; i < WINDOW_SIZE; i++) {
+            sumx += buf_x[i] * buf_x[i];
+            sumy += buf_y[i] * buf_y[i];
+            sumz += buf_z[i] * buf_z[i];
+        }
+
+        rms_x = sqrt(sumx / WINDOW_SIZE);
+        rms_y = sqrt(sumy / WINDOW_SIZE);
+        rms_z = sqrt(sumz / WINDOW_SIZE);
+
+        idx = (idx + 1) % WINDOW_SIZE;
+
+        osDelay(10); // 100 Hz
+    }
+}
+
+static struct tcp_pcb *server_pcb;
+
+void tcp_server_init(void)
+{
+    server_pcb = tcp_new();
+    if (server_pcb == NULL) return;
+
+    tcp_bind(server_pcb, IP_ADDR_ANY, 1234);
+    server_pcb = tcp_listen(server_pcb);
+
+    tcp_accept(server_pcb, tcp_server_accept);
+}
+
+err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
+{
+    char msg[80];
+    sprintf(msg, "📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    tcp_recv(newpcb, tcp_server_recv);
+    return ERR_OK;
+
+    HAL_UART_Transmit(&huart3,
+        (uint8_t*)"📥 Connexion reçue\r\n",
+        20,
+        HAL_MAX_DELAY
+    );
+
+}
+
+
+err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    if (err != ERR_OK) {
+        if (p) pbuf_free(p);
+        return err;
+    }
+
+    // connexion fermée par le client
+    if (p == NULL) {
+        tcp_close(tpcb);
+        return ERR_OK;
+    }
+
+    // Buffer local pour impression
+    char buffer[256];
+    memset(buffer, 0, sizeof(buffer));
+
+    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
+    memcpy(buffer, p->payload, len);
+    buffer[len] = 0;
+
+    // 🔥 LOG UART : afficher tout ce qui arrive
+    char msg[300];
+    snprintf(msg, sizeof(msg),
+             "📩 RECU DE %s : %s\r\n",
+             ipaddr_ntoa(&tpcb->remote_ip),
+             buffer);
+
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Indiquer à LwIP qu'on a consommé les données
+    tcp_recved(tpcb, p->tot_len);
+
+    // --- Traitement normal ---
+    if (strstr(buffer, "\"data_request\""))
+    {
+        char response[256];
+        int resp_len = snprintf(response, sizeof(response),
+            "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+            "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f} }",
+            rms_x, rms_y, rms_z);
+
+        tcp_write(tpcb, response, resp_len, TCP_WRITE_FLAG_COPY);
+        tcp_output(tpcb);
+        tcp_close(tpcb);
+    }
+
+    pbuf_free(p);
+    return ERR_OK;
+}
+
+
+
+void send_data_request_tcp(const char *ip)
+{
+    struct tcp_pcb *pcb = tcp_new();
+    if (!pcb) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ tcp_new FAILED\r\n", 20, HAL_MAX_DELAY);
+        return;
+    }
+
+    ip_addr_t dest_ip;
+    ipaddr_aton(ip, &dest_ip);
+
+    char msg[80];
+    snprintf(msg, sizeof(msg), "🔵 Connexion vers %s...\r\n", ip);
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    err_t err = tcp_connect(pcb, &dest_ip, 1234, tcp_client_connected);
+
+    if (err != ERR_OK) {
+        snprintf(msg, sizeof(msg),
+                 "❌ tcp_connect ERROR = %d\r\n", err);
+        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        tcp_abort(pcb);
+    }
+}
+
+
+
+err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
+{
+    if (err != ERR_OK) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ Connexion échouée\r\n", 24, HAL_MAX_DELAY);
+        tcp_close(tpcb);
+        return err;
+    }
+
+    // --- LOG connexion réussie ---
+    char msg[80];
+    snprintf(msg, sizeof(msg),
+             "🟢 Connecté à %s\r\n",
+             ipaddr_ntoa(&tpcb->remote_ip));
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // --- 1) Envoi du data_request ---
+    const char *request = "{ \"type\": \"data_request\", \"from\": \"nucleo-8\" }";
+
+    tcp_write(tpcb, request, strlen(request), TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+
+    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 data_request envoyé\r\n", 27, HAL_MAX_DELAY);
+
+    // --- 2) Envoi du data_send avec RMS ---
+    char sendbuf[200];
+    int len = snprintf(sendbuf, sizeof(sendbuf),
+        "{ \"type\": \"data_send\", \"id\": \"nucleo-8\", "
+        "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f} }",
+        rms_x, rms_y, rms_z);
+
+    tcp_write(tpcb, sendbuf, len, TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb);
+
+    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 data_send RMS envoyé\r\n",
+                      30, HAL_MAX_DELAY);
+
+    // Fermeture connexion
+    tcp_close(tpcb);
+    return ERR_OK;
+}
+
+
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -629,6 +855,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   * @retval None
   */
 /* USER CODE END Header_StartDefaultTask */
+
 void StartDefaultTask(void const * argument)
 {
   /* init code for LWIP */
@@ -661,6 +888,8 @@ void StartDefaultTask(void const * argument)
     }
     osDelay(50);
   }
+
+
   /* USER CODE END 5 */
 }
 
@@ -683,8 +912,19 @@ void LogMessageTask(void const * argument)
     uint16_t az = adc_raw[2];
     uint32_t t = HAL_GetTick();
 
-    int len = snprintf(msg, sizeof(msg), "[%8lu ms] X=%4u Y=%4u Z=%4u\r\n", t, ax, ay, az);
+    int len;
+    len = snprintf(msg, sizeof(msg), "[%8lu ms] X=%4u Y=%4u Z=%4u\r\n", t, ax, ay, az);
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+
+    /* affichage temporaire pour verifier les RMS*/
+    len = snprintf(msg, sizeof(msg),
+       "[%lu ms] RMS: X=%.2f Y=%.2f Z=%.2f\r\n", t, rms_x, rms_y, rms_z);
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+
+
+    /*connect to qq1*/
+
+
 
     osDelay(100); // ≈10 Hz => recommandé en debug
   }
@@ -702,10 +942,28 @@ void StartClientTask(void const * argument)
 {
   /* USER CODE BEGIN StartClientTask */
   /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
+    /* attendre init réseau */
+    extern struct netif gnetif;
+    while (!netif_is_up(&gnetif))
+        osDelay(100);
+
+    const char *node_list[] = {
+        "192.168.1.180",
+        "192.168.1.185",
+        "192.168.1.41"
+    };
+    const uint8_t node_count = 3;
+
+    for(;;)
+    {
+    	for (int i = 0; i < node_count; i++)
+    	{
+    	    send_data_request_tcp(node_list[i]);
+    	}
+
+
+        osDelay(10000); // 60 secondes
+    }
   /* USER CODE END StartClientTask */
 }
 
@@ -720,10 +978,16 @@ void StartServerTask(void const * argument)
 {
   /* USER CODE BEGIN StartServerTask */
   /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
-  }
+    extern struct netif gnetif;
+    while (!netif_is_up(&gnetif))
+        osDelay(100);
+
+    tcp_server_init(); // <-- nouveau serveur TCP
+
+    for(;;)
+    {
+        osDelay(1);
+    }
   /* USER CODE END StartServerTask */
 }
 
