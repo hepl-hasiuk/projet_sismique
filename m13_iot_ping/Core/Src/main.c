@@ -29,7 +29,6 @@
 #include <string.h>
 #include <math.h>
 #include "lwip/tcp.h"
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -66,7 +65,8 @@ osMutexId uartMutexHandle;
 #define WINDOW_SIZE 100
 osThreadId presenceTaskHandle; // handle de la tâche de présence
 uint16_t adc_raw[3];
-//seismic
+
+//seismic part
 osThreadId seismicTaskHandle;
 float avg_x = 0, avg_y = 0, avg_z = 0;
 float rms_x = 0, rms_y = 0, rms_z = 0;
@@ -74,8 +74,6 @@ float buf_x[WINDOW_SIZE];
 float buf_y[WINDOW_SIZE];
 float buf_z[WINDOW_SIZE];
 uint16_t idx = 0;
-
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,23 +89,17 @@ void LogMessageTask(void const * argument);
 void StartClientTask(void const * argument);
 void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
-
 /* USER CODE BEGIN PFP */
 void StartPresenceTask(void const * argument);
 void send_presence_broadcast(void);
 void StartSeismicTask(void const * argument);
-
-
-
-
-
+/*server*/
 void tcp_server_init(void);
 err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 
 void send_data_request_tcp(const char *ip);
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err);
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -590,8 +582,9 @@ void StartPresenceTask(void const * argument)
 {
   /* On attend que LwIP soit initialisé */
   extern struct netif gnetif;
-  while (!netif_is_up(&gnetif)) {
-    osDelay(100);
+  while (!netif_is_up(&gnetif))
+  {
+	  osDelay(100);
   }
 
   for(;;)
@@ -610,7 +603,8 @@ void send_presence_broadcast(void)
   err_t err;
 
   pcb = udp_new();
-  if (!pcb) {
+  if (!pcb)
+  {
     return;
   }
 
@@ -629,11 +623,11 @@ void send_presence_broadcast(void)
 
   snprintf(json, sizeof(json),
       "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", \"timestamp\": \"2025-10-02T08:20:00Z\" }",
-      device_ip
-  );
+      device_ip);
 
   p = pbuf_alloc(PBUF_TRANSPORT, strlen(json), PBUF_RAM);
-  if (!p) {
+  if (!p)
+  {
     udp_remove(pcb);
     return;
   }
@@ -649,7 +643,8 @@ void send_presence_broadcast(void)
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  if (hadc->Instance == ADC1) {
+  if (hadc->Instance == ADC1)
+  {
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
   }
 }
@@ -678,7 +673,8 @@ void StartSeismicTask(void const * argument)
         buf_z[idx] = avg_z;
 
         float sumx = 0, sumy = 0, sumz = 0;
-        for(int i = 0; i < WINDOW_SIZE; i++) {
+        for(int i = 0; i < WINDOW_SIZE; i++)
+        {
             sumx += buf_x[i] * buf_x[i];
             sumy += buf_y[i] * buf_y[i];
             sumz += buf_z[i] * buf_z[i];
@@ -724,13 +720,15 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-    if (err != ERR_OK) {
+    if (err != ERR_OK)
+    {
         if (p) pbuf_free(p);
         return err;
     }
 
     // connexion fermée par le client
-    if (p == NULL) {
+    if (p == NULL)
+    {
         tcp_close(tpcb);
         return ERR_OK;
     }
@@ -806,7 +804,8 @@ void send_data_request_tcp(const char *ip)
 
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
-    if (err != ERR_OK) {
+    if (err != ERR_OK)
+    {
         HAL_UART_Transmit(&huart3, (uint8_t*)"❌ Connexion échouée\r\n", 24, HAL_MAX_DELAY);
         tcp_close(tpcb);
         return err;
@@ -927,7 +926,7 @@ void LogMessageTask(void const * argument)
     /*connect to qq1*/
 
 
-
+ /*Time uart envoie données*/
     osDelay(100); // ≈10 Hz => recommandé en debug
   }
   /* USER CODE END LogMessageTask */
