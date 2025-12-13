@@ -20,6 +20,7 @@
 #include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lwip/udp.h"
@@ -38,7 +39,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PRESENCE_PORT 12345 // même port que ton script Python
+#define WINDOW_SIZE 100     // 💡 Taille de la fenêtre pour le calcul de la moyenne (1s à 100Hz)
+#define SEISMIC_THRESHOLD 300.0f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,8 +52,11 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
+
 RTC_HandleTypeDef hrtc;
+
 TIM_HandleTypeDef htim2;
+
 UART_HandleTypeDef huart3;
 
 osThreadId defaultTaskHandle;
@@ -61,19 +67,22 @@ osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
-#define PRESENCE_PORT 1234 // même port que ton script Python
-#define WINDOW_SIZE 100
+
 osThreadId presenceTaskHandle; // handle de la tâche de présence
-uint16_t adc_raw[3];
+uint16_t adc_raw[3];           // 💡 Buffer rempli automatiquement par le DMA (X, Y, Z)
 
 //seismic part
 osThreadId seismicTaskHandle;
+// 💡 Variables pour le lissage (filtre passe-bas)
 float avg_x = 0, avg_y = 0, avg_z = 0;
+// 💡 Variables finales calculées (énergie du signal)
 float rms_x = 0, rms_y = 0, rms_z = 0;
+// 💡 Historique des valeurs lissées pour le calcul RMS
 float buf_x[WINDOW_SIZE];
 float buf_y[WINDOW_SIZE];
 float buf_z[WINDOW_SIZE];
-uint16_t idx = 0;
+//uint16_t idx = 0; // 💡 Index pour parcourir le tableau circulaire
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,6 +98,7 @@ void LogMessageTask(void const * argument);
 void StartClientTask(void const * argument);
 void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
+
 /* USER CODE BEGIN PFP */
 void StartPresenceTask(void const * argument);
 void send_presence_broadcast(void);
@@ -100,6 +110,10 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
 
 void send_data_request_tcp(const char *ip);
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err);
+err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
+
+osSemaphoreId adcReadySemHandle;
+osMutexId dataMutexHandle;
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -142,7 +156,10 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
+  // 💡 Démarrage du Timer qui cadence l'ADC (pour avoir 100Hz précis)
   HAL_TIM_Base_Start(&htim2);
+  // 💡 Démarrage de l'ADC en mode DMA Circulaire.
+  // Le CPU n'a rien à faire, le DMA remplit le tableau 'adc_raw' tout seul en arrière-plan.
   HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 3);
   /* USER CODE END 2 */
 
@@ -151,12 +168,24 @@ int main(void)
   osMutexDef(uartMutex);
   uartMutexHandle = osMutexCreate(osMutex(uartMutex));
 
+  osMutexDef(dataMutex);
+  dataMutexHandle = osMutexCreate(osMutex(dataMutex));
+
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
   /* add semaphores, ... */
+
+
+  /* definition and creation of adcReadySem */
+  osSemaphoreDef(adcReadySem);
+  adcReadySemHandle = osSemaphoreCreate(osSemaphore(adcReadySem), 1);
+  // On le prend une fois au début pour qu'il soit "vide" au démarrage
+  osSemaphoreWait(adcReadySemHandle, 0);
+
+
   /* USER CODE END RTOS_SEMAPHORES */
 
   /* USER CODE BEGIN RTOS_TIMERS */
@@ -195,17 +224,21 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* definition and creation of presenceTask */
+  // 💡 Tâche Présence : Envoie un message UDP "Je suis là" à tout le monde
   osThreadDef(presenceTask, StartPresenceTask, osPriorityBelowNormal, 0, 256);
   presenceTaskHandle = osThreadCreate(osThread(presenceTask), NULL);
   /* add threads, ... */
 
 
   /* definition and creation of seismicTask */
+  // 💡 Tâche Sismique : Priorité ÉLEVÉE car calcul critique en temps réel
   osThreadDef(seismicTask, StartSeismicTask, osPriorityAboveNormal, 0, 512);
   seismicTaskHandle = osThreadCreate(osThread(seismicTask), NULL);
 
 
   /* 🚨 IMPORTANT : tout suspendre au début */
+  // 💡 Au démarrage, on met tout en pause. Seule la tâche par défaut tourne
+  // pour attendre l'appui sur le bouton bleu.
   osThreadSuspend(heartBeatTaskHandle);
   osThreadSuspend(presenceTaskHandle);
   osThreadSuspend(logMessageTaskHandle);
@@ -577,11 +610,15 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-
+/**
+  * @brief Tâche pour la découverte réseau (Protocole de présence)
+  * @note  Envoie périodiquement un broadcast UDP pour dire "Je suis là"
+  */
 void StartPresenceTask(void const * argument)
 {
   /* On attend que LwIP soit initialisé */
   extern struct netif gnetif;
+  // 💡 Boucle d'attente : tant que le câble n'est pas branché ou l'IP non reçue
   while (!netif_is_up(&gnetif))
   {
 	  osDelay(100);
@@ -590,11 +627,14 @@ void StartPresenceTask(void const * argument)
   for(;;)
   {
     send_presence_broadcast(); // envoi du JSON en broadcast
-    osDelay(10000); // toutes les 1 seconde
+    osDelay(10000); // toutes les 10 secondes
   }
 }
 
-
+/**
+  * @brief Fonction d'envoi du message UDP Broadcast
+  * @note  Crée un socket UDP temporaire, envoie le JSON, puis ferme le socket.
+  */
 void send_presence_broadcast(void)
 {
   struct udp_pcb *pcb;
@@ -602,29 +642,36 @@ void send_presence_broadcast(void)
   ip_addr_t dest_ip;
   err_t err;
 
+  // 💡 Création d'un "Protocol Control Block" (socket léger LwIP)
   pcb = udp_new();
   if (!pcb)
   {
     return;
   }
 
+  // 💡 Option SOF_BROADCAST indispensable pour envoyer à .255
   pcb->so_options |= SOF_BROADCAST;
 
   // Broadcast global (ça marche bien avec ton PC en 169.254.x.x)
-  ipaddr_aton("192.168.1.255", &dest_ip);
+  ipaddr_aton("192.168.129.255", &dest_ip);
 
   // Bind sur n'importe quelle IP / n'importe quel port
   udp_bind(pcb, IP_ADDR_ANY, 0);
 
   // Construction du JSON
-  char json[256];
-  // IMPORTANT : mettre l'IP réelle de la carte
-  const char *device_ip = "192.168.001.181";
+  // Construction du JSON
+    char json[256];
 
-  snprintf(json, sizeof(json),
-      "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", \"timestamp\": \"2025-10-02T08:20:00Z\" }",
-      device_ip);
+    // 💡 CORRECTION : Récupération dynamique de l'IP réelle via LwIP
+    extern struct netif gnetif;
+    char *device_ip = ipaddr_ntoa(&gnetif.ip_addr);
 
+    // 💡 snprintf formate le message JSON avec l'IP dynamique
+    snprintf(json, sizeof(json),
+        "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", \"timestamp\": \"2025-10-02T08:20:00Z\" }",
+        device_ip);
+
+  // 💡 Allocation d'un buffer LwIP (pbuf) en RAM
   p = pbuf_alloc(PBUF_TRANSPORT, strlen(json), PBUF_RAM);
   if (!p)
   {
@@ -632,83 +679,153 @@ void send_presence_broadcast(void)
     return;
   }
 
+  // 💡 Copie des données dans le buffer
   memcpy(p->payload, json, strlen(json));
+  // 💡 Envoi effectif du paquet UDP
   err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
 
+  // 💡 TRES IMPORTANT : Libération mémoire pour éviter les fuites (Memory Leak)
   pbuf_free(p);
   udp_remove(pcb);
 
   //  éventuellement afficher err via UART si tu veux debug
 }
 
+// 💡 Callback appelée automatiquement par le hardware quand le DMA a fini de remplir le buffer ADC
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
-  if (hadc->Instance == ADC1)
-  {
-    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-  }
+	if (hadc->Instance == ADC1)
+	  {
+	    // On libère le sémaphore pour réveiller la tâche sismique
+	    osSemaphoreRelease(adcReadySemHandle);
+	    // Toggle LED pour debug visuel (optionnel)
+	    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+	  }
 }
 
+/**
+  * @brief Tâche de traitement du signal sismique
+  * @note  Lit les valeurs brutes, filtre (moyenne) et calcule l'énergie (RMS)
+  */
 void StartSeismicTask(void const * argument)
 {
+    // Initialisation des buffers à 0
     memset(buf_x, 0, sizeof(buf_x));
     memset(buf_y, 0, sizeof(buf_y));
     memset(buf_z, 0, sizeof(buf_z));
 
+    // Index circulaire et timer pour éviter le spam UART
+    int buffer_idx = 0;
+    uint32_t last_alert_time = 0; // 👇 Pour limiter l'affichage
+
     for(;;)
     {
-        // 1) Lire valeurs brutes
-        float x = adc_raw[0];
-        float y = adc_raw[1];
-        float z = adc_raw[2];
+        // Attente synchro DMA (100Hz)
+        osSemaphoreWait(adcReadySemHandle, osWaitForever);
 
-        // 2) Moyenne glissante simple
-        avg_x = 0.9f * avg_x + 0.1f * x;
-        avg_y = 0.9f * avg_y + 0.1f * y;
-        avg_z = 0.9f * avg_z + 0.1f * z;
+        // 1) Lire valeurs brutes et conversion float
+        float raw_x = (float)adc_raw[0];
+        float raw_y = (float)adc_raw[1];
+        float raw_z = (float)adc_raw[2];
 
-        // 3) RMS sur 1 seconde (100 échantillons)
-        buf_x[idx] = avg_x;
-        buf_y[idx] = avg_y;
-        buf_z[idx] = avg_z;
+        // 2) Remplissage du Buffer (SANS FILTRE 0.9/0.1)
+        buf_x[buffer_idx] = raw_x;
+        buf_y[buffer_idx] = raw_y;
+        buf_z[buffer_idx] = raw_z;
 
-        float sumx = 0, sumy = 0, sumz = 0;
-        for(int i = 0; i < WINDOW_SIZE; i++)
-        {
-            sumx += buf_x[i] * buf_x[i];
-            sumy += buf_y[i] * buf_y[i];
-            sumz += buf_z[i] * buf_z[i];
+        // 3) Calcul de la MOYENNE (Gravité / Offset DC)
+        float mean_x = 0, mean_y = 0, mean_z = 0;
+        for(int i = 0; i < WINDOW_SIZE; i++) {
+            mean_x += buf_x[i];
+            mean_y += buf_y[i];
+            mean_z += buf_z[i];
+        }
+        mean_x /= WINDOW_SIZE;
+        mean_y /= WINDOW_SIZE;
+        mean_z /= WINDOW_SIZE;
+
+        // 4) Calcul de la VARIANCE (Énergie de la vibration)
+        float var_x = 0, var_y = 0, var_z = 0;
+        for(int i = 0; i < WINDOW_SIZE; i++) {
+            var_x += powf(buf_x[i] - mean_x, 2);
+            var_y += powf(buf_y[i] - mean_y, 2);
+            var_z += powf(buf_z[i] - mean_z, 2);
         }
 
-        rms_x = sqrt(sumx / WINDOW_SIZE);
-        rms_y = sqrt(sumy / WINDOW_SIZE);
-        rms_z = sqrt(sumz / WINDOW_SIZE);
+        // 5) Calcul RMS final (Écart-type)
+        float calc_rms_x = sqrtf(var_x / WINDOW_SIZE);
+        float calc_rms_y = sqrtf(var_y / WINDOW_SIZE);
+        float calc_rms_z = sqrtf(var_z / WINDOW_SIZE);
 
-        idx = (idx + 1) % WINDOW_SIZE;
+        // 6) Mise à jour thread-safe des globales
+        osMutexWait(dataMutexHandle, osWaitForever);
+        rms_x = calc_rms_x;
+        rms_y = calc_rms_y;
+        rms_z = calc_rms_z;
+        osMutexRelease(dataMutexHandle);
 
-        osDelay(10); // 100 Hz
+        // 👇 7) NOUVEAU : Détection de seuil et Alerte UART
+        // On vérifie si ça dépasse 300 ET si on n'a pas déjà crié il y a moins d'1 seconde
+        if ((calc_rms_x > SEISMIC_THRESHOLD || calc_rms_y > SEISMIC_THRESHOLD || calc_rms_z > SEISMIC_THRESHOLD)
+             && (HAL_GetTick() - last_alert_time > 1000))
+        {
+            char alert_msg[100];
+            // On affiche le message avec la valeur max détectée pour info
+            float max_val = calc_rms_x;
+            if(calc_rms_y > max_val) max_val = calc_rms_y;
+            if(calc_rms_z > max_val) max_val = calc_rms_z;
+
+            int len = snprintf(alert_msg, sizeof(alert_msg),
+                               "\r\n>>> ⚠️ TREMBLEMENT DETECTE ! (Intensite: %.0f) <<<\r\n", max_val);
+
+            // Note: C'est mieux d'utiliser un Mutex sur l'UART si possible,
+            // mais ici HAL_UART_Transmit est "thread-safe" par défaut sur STM32 (il bloque).
+            HAL_UART_Transmit(&huart3, (uint8_t*)alert_msg, len, 100);
+
+            // On allume la LED Rouge (LD3) pour le fun, si tu veux !
+            HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+
+            last_alert_time = HAL_GetTick();
+        }
+        else if (HAL_GetTick() - last_alert_time > 1000)
+        {
+             // On éteint la LED Rouge si tout est calme
+             HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+        }
+
+        // Gestion de l'index circulaire
+        buffer_idx = (buffer_idx + 1) % WINDOW_SIZE;
     }
 }
 
 static struct tcp_pcb *server_pcb;
 
+/**
+  * @brief Initialisation du serveur TCP
+  * @note  Ouvre le port 12345 en écoute
+  */
 void tcp_server_init(void)
 {
     server_pcb = tcp_new();
     if (server_pcb == NULL) return;
 
-    tcp_bind(server_pcb, IP_ADDR_ANY, 1234);
+    // 💡 Bind : on attache le PCB au port 12345
+    tcp_bind(server_pcb, IP_ADDR_ANY, 12345);
+    // 💡 Listen : on passe en mode écoute
     server_pcb = tcp_listen(server_pcb);
 
+    // 💡 Accept : on définit quelle fonction appeler quand un client se connecte
     tcp_accept(server_pcb, tcp_server_accept);
 }
 
+// 💡 Callback appelée quand un nouveau client se connecte au serveur
 err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     char msg[80];
     sprintf(msg, "📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
+    // 💡 On définit la fonction de réception pour cette nouvelle connexion
     tcp_recv(newpcb, tcp_server_recv);
 
     return ERR_OK;
@@ -717,7 +834,7 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 
 }
 
-
+// 💡 Callback appelée quand des données arrivent sur le serveur
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
     if (err != ERR_OK)
@@ -726,7 +843,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
         return err;
     }
 
-    // connexion fermée par le client
+    // 💡 Si p == NULL, cela signifie que le client a fermé la connexion
     if (p == NULL)
     {
         tcp_close(tpcb);
@@ -737,6 +854,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     char buffer[256];
     memset(buffer, 0, sizeof(buffer));
 
+    // Copie sécurisée des données
     uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
     memcpy(buffer, p->payload, len);
     buffer[len] = 0;
@@ -750,31 +868,47 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
 
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    // Indiquer à LwIP qu'on a consommé les données
+    // 💡 Indiquer à LwIP qu'on a bien traité les données (pour libérer la fenêtre TCP)
     tcp_recved(tpcb, p->tot_len);
 
-    // --- Traitement normal ---
+    // --- Traitement logique ---
+    // Si la requête contient "data_request", on renvoie nos valeurs RMS
     if (strstr(buffer, "\"data_request\""))
     {
-        char response[256];
-        int resp_len = snprintf(response, sizeof(response),
-                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-                "\"timestamp\": \"2025-10-02T08:21:01Z\", "
-                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-                "\"status\": \"normal\" }",
-                rms_x, rms_y, rms_z);
+    	// 💡 CORRECTION : Variables temporaires pour la lecture atomique
+    	        float tx_x, tx_y, tx_z;
 
+    	        // On verrouille le Mutex pour lire proprement
+    	        osMutexWait(dataMutexHandle, osWaitForever);
+    	        tx_x = rms_x;
+    	        tx_y = rms_y;
+    	        tx_z = rms_z;
+    	        osMutexRelease(dataMutexHandle);
+
+    	        char response[256];
+    	        int resp_len = snprintf(response, sizeof(response),
+    	                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+    	                "\"timestamp\": \"2025-10-02T08:21:01Z\", "
+    	                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+    	                "\"status\": \"normal\" }",
+    	                tx_x, tx_y, tx_z); // On utilise les copies locales
+
+        // Envoi de la réponse
         tcp_write(tpcb, response, resp_len, TCP_WRITE_FLAG_COPY);
+        // Force l'envoi immédiat
         tcp_output(tpcb);
+        // Fermeture de la connexion (modèle requête/réponse simple)
         tcp_close(tpcb);
     }
 
+    // Libération du buffer de réception
     pbuf_free(p);
     return ERR_OK;
 }
 
-
-
+/**
+  * @brief Fonction Client TCP : Initie une connexion vers une IP
+  */
 void send_data_request_tcp(const char *ip)
 {
     struct tcp_pcb *pcb = tcp_new();
@@ -790,57 +924,80 @@ void send_data_request_tcp(const char *ip)
     snprintf(msg, sizeof(msg), "🔵 Connexion vers %s...\r\n", ip);
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    err_t err = tcp_connect(pcb, &dest_ip, 1234, tcp_client_connected);
+    // 💡 Tentative de connexion sur le port 12345
+    // Si succès -> tcp_client_connected sera appelée
+    err_t err = tcp_connect(pcb, &dest_ip, 12345, tcp_client_connected);
 
     if (err != ERR_OK) {
         snprintf(msg, sizeof(msg),
                  "❌ tcp_connect ERROR = %d\r\n", err);
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-        tcp_abort(pcb);
+        tcp_abort(pcb); // Annule le PCB en cas d'erreur
     }
 }
 
 
-
+// 💡 Callback appelée quand la connexion client est réussie
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
-    if (err != ERR_OK)
-    {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ Connexion échouée\r\n", 24, HAL_MAX_DELAY);
+    if (err != ERR_OK) {
         tcp_close(tpcb);
         return err;
     }
 
-    char msg[100];
-    snprintf(msg, sizeof(msg), "🟢 Connecté (Port 1234) à %s\r\n", ipaddr_ntoa(&tpcb->remote_ip));
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    // 💡 Etape 2 : On définit la fonction qui va écouter la RÉPONSE du serveur
+    tcp_recv(tpcb, tcp_client_recv_response);
 
-    // --- CORRECTION : On envoie tout en un seul gros paquet JSON pour éviter le collage ---
-    // On simule ici que le client envoie ses données RMS au serveur
-
+    // 💡 Construction de la REQUÊTE JSON (Conforme PDF [cite: 110-116])
     char sendbuf[256];
     int len = snprintf(sendbuf, sizeof(sendbuf),
-        "{ \"type\": \"data_send\", \"id\": \"nucleo-8\", "
-        "\"rms\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-        "\"request\": \"need_ack\" }", // On combine les infos
-        rms_x, rms_y, rms_z);
+        "{ \"type\": \"data_request\", \"from\": \"nucleo-8\", \"to\": \"broadcast\", \"timestamp\": \"2025-10-02T08:00:00Z\" }");
 
-    // Envoi des données
+    // Envoi
     tcp_write(tpcb, sendbuf, len, TCP_WRITE_FLAG_COPY);
-
-    // Force l'envoi immédiat
     tcp_output(tpcb);
 
-    HAL_UART_Transmit(&huart3, (uint8_t*)"📤 Données envoyées au Port 1234\r\n", 36, HAL_MAX_DELAY);
-
-    // IMPORTANT : Dans l'idéal, on ne ferme pas tout de suite, on attend la réponse.
-    // Mais pour cet exercice, on ferme proprement après un court délai pour laisser le temps au paquet de partir.
-    // Note : tcp_close gère normalement cela, mais c'est plus sûr ainsi en debug.
-    tcp_close(tpcb);
+    // ⚠️ IMPORTANT : On ne ferme PAS la connexion (tcp_close) ici !
+    // On attend que le serveur réponde. C'est tcp_client_recv_response qui fermera.
 
     return ERR_OK;
 }
 
+err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    if (err != ERR_OK) {
+        if (p) pbuf_free(p);
+        return err;
+    }
+
+    if (p == NULL) {
+        // Le serveur a fermé la connexion
+        tcp_close(tpcb);
+        return ERR_OK;
+    }
+
+    // Lecture des données reçues
+    char buffer[256];
+    memset(buffer, 0, sizeof(buffer));
+    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
+    memcpy(buffer, p->payload, len);
+    buffer[len] = 0;
+
+    // 💡 Affichage de la réponse du voisin (Acceleration X, Y, Z)
+    // C'est ici que tu valides l'exigence "Récupérer leurs données"
+    char msg[300];
+    snprintf(msg, sizeof(msg), "✅ REPONSE REÇUE : %s\r\n", buffer);
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    // Acquittement LwIP
+    tcp_recved(tpcb, p->tot_len);
+
+    // Une fois la réponse reçue, on peut fermer proprement
+    pbuf_free(p);
+    tcp_close(tpcb);
+
+    return ERR_OK;
+}
 
 
 /* USER CODE END 4 */
@@ -852,26 +1009,27 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
   * @retval None
   */
 /* USER CODE END Header_StartDefaultTask */
-
 void StartDefaultTask(void const * argument)
 {
   /* init code for LWIP */
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
-  uint8_t system_running = 0;
+  uint8_t system_running = 0; // Drapeau d'état système
 
   for(;;)
   {
-    // bouton pressé ?
+    // 💡 Détection de l'appui bouton (Actif Haut)
     if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET)
     {
-      osDelay(50); // anti-rebond
-      while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+      osDelay(50); // anti-rebond simple
+      while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET); // Attente relâchement
 
+      // Bascule de l'état
       if (!system_running) {
         system_running = 1;
         HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM STARTED\r\n", 16, HAL_MAX_DELAY);
+        // 💡 RÉVEIL de toutes les tâches
         osThreadResume(heartBeatTaskHandle);
         osThreadResume(presenceTaskHandle);
         osThreadResume(logMessageTaskHandle);
@@ -880,6 +1038,7 @@ void StartDefaultTask(void const * argument)
       } else {
         system_running = 0;
         HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM STOPPED\r\n", 16, HAL_MAX_DELAY);
+        // 💡 Mise en PAUSE de toutes les tâches
         osThreadSuspend(heartBeatTaskHandle);
         osThreadSuspend(presenceTaskHandle);
         osThreadSuspend(logMessageTaskHandle);
@@ -914,20 +1073,33 @@ void LogMessageTask(void const * argument)
     uint32_t t = HAL_GetTick();
 
     int len;
+    // Log des valeurs brutes ADC
     len = snprintf(msg, sizeof(msg), "[%8lu ms] X=%4u Y=%4u Z=%4u\r\n", t, ax, ay, az);
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
 
     /* affichage temporaire pour verifier les RMS*/
-    len = snprintf(msg, sizeof(msg),
-       "[%lu ms] RMS: X=%.2f Y=%.2f Z=%.2f\r\n", t, rms_x, rms_y, rms_z);
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
+    // Log des valeurs calculées RMS
+    /* affichage temporaire pour verifier les RMS*/
+
+        // 💡 CORRECTION : Lecture protégée par Mutex
+        float log_x, log_y, log_z;
+        osMutexWait(dataMutexHandle, osWaitForever);
+        log_x = rms_x;
+        log_y = rms_y;
+        log_z = rms_z;
+        osMutexRelease(dataMutexHandle);
+
+        // Log des valeurs calculées RMS (avec les copies locales)
+        len = snprintf(msg, sizeof(msg),
+           "[%lu ms] RMS: X=%.2f Y=%.2f Z=%.2f\r\n", t, log_x, log_y, log_z);
+        HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
 
 
     /*connect to qq1*/
 
 
  /*Time uart envoie données*/
-    osDelay(100); // ≈10 Hz => recommandé en debug
+    osDelay(1000); // ≈10 Hz => recommandé en debug
   }
   /* USER CODE END LogMessageTask */
 }
@@ -948,23 +1120,28 @@ void StartClientTask(void const * argument)
     while (!netif_is_up(&gnetif))
         osDelay(100);
 
-    const char *node_list[] = {
+    // Liste des voisins à interroger
+    /*const char *node_list[] = {
         "192.168.1.180",
+		"192.168.1.177",
         "192.168.1.185",
-        "192.168.1.41"
-    };
-    const uint8_t node_count = 3;
+        "192.168.129.59"
+    };*/
+
+    const char *node_list[] = {"192.168.129.59"};
+    const uint8_t node_count = 1;
+
+    /*const uint8_t node_count = 4;*/ /* changer absolument quand je rajoute une ip*/
 
     for(;;)
     {
+        // 💡 Boucle pour contacter chaque nœud de la liste
     	for (int i = 0; i < node_count; i++)
     	{
     	    send_data_request_tcp(node_list[i]);
-    	    osDelay(200);
+    	    osDelay(200); // Petite pause pour ne pas saturer
     	}
-
-
-        osDelay(10000); // 60 secondes
+        osDelay(10000); // Pause longue (10s) avant le prochain cycle
     }
   /* USER CODE END StartClientTask */
 }
@@ -983,12 +1160,12 @@ void StartServerTask(void const * argument)
     extern struct netif gnetif;
     while (!netif_is_up(&gnetif))
         osDelay(100);
+    HAL_UART_Transmit(&huart3, (uint8_t*)"SERVER TASK STARTED\r\n", 21, HAL_MAX_DELAY);
 
-    tcp_server_init(); // <-- nouveau serveur TCP
-
+    tcp_server_init(); // <-- nouveau serveur TCP (mise en écoute)
     for(;;)
     {
-        osDelay(1);
+        osDelay(1); // Le thread reste vivant mais ne fait rien (LwIP gère par interruptions)
     }
   /* USER CODE END StartServerTask */
 }
@@ -1007,7 +1184,7 @@ void StartHeartBeatTask(void const * argument)
   for(;;)
   {
     HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
-    osDelay(500);
+    osDelay(500); // 1 Hz (500ms ON, 500ms OFF)
   }
   /* USER CODE END StartHeartBeatTask */
 }
