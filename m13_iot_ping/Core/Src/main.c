@@ -53,7 +53,11 @@
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
+I2C_HandleTypeDef hi2c1;
+
 RTC_HandleTypeDef hrtc;
+
+SPI_HandleTypeDef hspi2;
 
 TIM_HandleTypeDef htim2;
 
@@ -83,6 +87,24 @@ float buf_y[WINDOW_SIZE];
 float buf_z[WINDOW_SIZE];
 //uint16_t idx = 0; // 💡 Index pour parcourir le tableau circulaire
 
+// Commandes SPI standards FRAM
+#define RTC_ADDR 0xD0
+#define FRAM_WREN  0x06     // Write Enable (Autoriser écriture)
+#define FRAM_WRITE 0x02     // Write Data
+#define FRAM_READ  0x03     // Read Data
+
+
+// Structure pour stocker un événement (Taille = 8 octets)
+typedef struct {
+    uint8_t hour;
+    uint8_t min;
+    uint8_t sec;
+    uint8_t reserved; // Juste pour aligner la mémoire
+    float intensity;  // La valeur RMS max
+} SeismicEvent;
+
+#define FRAM_EVENT_ADDR 0x10
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -93,6 +115,8 @@ static void MX_USART3_UART_Init(void);
 static void MX_RTC_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI2_Init(void);
 void StartDefaultTask(void const * argument);
 void LogMessageTask(void const * argument);
 void StartClientTask(void const * argument);
@@ -114,6 +138,17 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 
 osSemaphoreId adcReadySemHandle;
 osMutexId dataMutexHandle;
+
+/* Fonctions RTC (Gestion Heure) */
+uint8_t decToBcd(int val);
+int bcdToDec(uint8_t val);
+void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec);
+void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec);
+
+/* Fonctions FRAM (Gestion Mémoire) */
+void FRAM_Write(uint32_t addr, uint8_t *pData, uint16_t size);
+void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -155,6 +190,8 @@ int main(void)
   MX_RTC_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
+  MX_I2C1_Init();
+  MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
   // 💡 Démarrage du Timer qui cadence l'ADC (pour avoir 100Hz précis)
   HAL_TIM_Base_Start(&htim2);
@@ -168,11 +205,10 @@ int main(void)
   osMutexDef(uartMutex);
   uartMutexHandle = osMutexCreate(osMutex(uartMutex));
 
-  osMutexDef(dataMutex);
-  dataMutexHandle = osMutexCreate(osMutex(dataMutex));
-
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
+  osMutexDef(dataMutex);
+  dataMutexHandle = osMutexCreate(osMutex(dataMutex));
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -381,6 +417,54 @@ static void MX_ADC1_Init(void)
 }
 
 /**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.Timing = 0x40000A0B;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Analogue filter
+  */
+  if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Digital filter
+  */
+  if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
   * @brief RTC Initialization Function
   * @param None
   * @retval None
@@ -440,6 +524,46 @@ static void MX_RTC_Init(void)
   /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief SPI2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI2_Init(void)
+{
+
+  /* USER CODE BEGIN SPI2_Init 0 */
+
+  /* USER CODE END SPI2_Init 0 */
+
+  /* USER CODE BEGIN SPI2_Init 1 */
+
+  /* USER CODE END SPI2_Init 1 */
+  /* SPI2 parameter configuration*/
+  hspi2.Instance = SPI2;
+  hspi2.Init.Mode = SPI_MODE_MASTER;
+  hspi2.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi2.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi2.Init.NSS = SPI_NSS_SOFT;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi2.Init.CRCPolynomial = 7;
+  hspi2.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi2.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI2_Init 2 */
+
+  /* USER CODE END SPI2_Init 2 */
 
 }
 
@@ -562,6 +686,9 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin|LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(FRAM_CS_GPIO_Port, FRAM_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : USER_Btn_Pin */
@@ -576,6 +703,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : FRAM_CS_Pin */
+  GPIO_InitStruct.Pin = FRAM_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(FRAM_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
   GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
@@ -709,91 +843,88 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   */
 void StartSeismicTask(void const * argument)
 {
-    // Initialisation des buffers à 0
+    // Init buffers
     memset(buf_x, 0, sizeof(buf_x));
     memset(buf_y, 0, sizeof(buf_y));
     memset(buf_z, 0, sizeof(buf_z));
-
-    // Index circulaire et timer pour éviter le spam UART
     int buffer_idx = 0;
-    uint32_t last_alert_time = 0; // 👇 Pour limiter l'affichage
+    uint32_t last_alert_time = 0;
 
     for(;;)
     {
-        // Attente synchro DMA (100Hz)
+        // Synchro ADC (100Hz)
         osSemaphoreWait(adcReadySemHandle, osWaitForever);
 
-        // 1) Lire valeurs brutes et conversion float
+        // Lecture Raw
         float raw_x = (float)adc_raw[0];
         float raw_y = (float)adc_raw[1];
         float raw_z = (float)adc_raw[2];
+        buf_x[buffer_idx] = raw_x; buf_y[buffer_idx] = raw_y; buf_z[buffer_idx] = raw_z;
 
-        // 2) Remplissage du Buffer (SANS FILTRE 0.9/0.1)
-        buf_x[buffer_idx] = raw_x;
-        buf_y[buffer_idx] = raw_y;
-        buf_z[buffer_idx] = raw_z;
-
-        // 3) Calcul de la MOYENNE (Gravité / Offset DC)
+        // Calcul Moyenne
         float mean_x = 0, mean_y = 0, mean_z = 0;
-        for(int i = 0; i < WINDOW_SIZE; i++) {
-            mean_x += buf_x[i];
-            mean_y += buf_y[i];
-            mean_z += buf_z[i];
-        }
-        mean_x /= WINDOW_SIZE;
-        mean_y /= WINDOW_SIZE;
-        mean_z /= WINDOW_SIZE;
+        for(int i=0; i<WINDOW_SIZE; i++) { mean_x+=buf_x[i]; mean_y+=buf_y[i]; mean_z+=buf_z[i]; }
+        mean_x/=WINDOW_SIZE; mean_y/=WINDOW_SIZE; mean_z/=WINDOW_SIZE;
 
-        // 4) Calcul de la VARIANCE (Énergie de la vibration)
+        // Calcul Variance
         float var_x = 0, var_y = 0, var_z = 0;
-        for(int i = 0; i < WINDOW_SIZE; i++) {
-            var_x += powf(buf_x[i] - mean_x, 2);
-            var_y += powf(buf_y[i] - mean_y, 2);
-            var_z += powf(buf_z[i] - mean_z, 2);
+        for(int i=0; i<WINDOW_SIZE; i++) {
+             var_x+=powf(buf_x[i]-mean_x,2); var_y+=powf(buf_y[i]-mean_y,2); var_z+=powf(buf_z[i]-mean_z,2);
         }
+        // Calcul RMS (Ecart-Type)
+        float calc_rms_x = sqrtf(var_x/WINDOW_SIZE);
+        float calc_rms_y = sqrtf(var_y/WINDOW_SIZE);
+        float calc_rms_z = sqrtf(var_z/WINDOW_SIZE);
 
-        // 5) Calcul RMS final (Écart-type)
-        float calc_rms_x = sqrtf(var_x / WINDOW_SIZE);
-        float calc_rms_y = sqrtf(var_y / WINDOW_SIZE);
-        float calc_rms_z = sqrtf(var_z / WINDOW_SIZE);
-
-        // 6) Mise à jour thread-safe des globales
+        // Mise à jour sécurisée des globales
         osMutexWait(dataMutexHandle, osWaitForever);
-        rms_x = calc_rms_x;
-        rms_y = calc_rms_y;
-        rms_z = calc_rms_z;
+        rms_x = calc_rms_x; rms_y = calc_rms_y; rms_z = calc_rms_z;
         osMutexRelease(dataMutexHandle);
 
-        // 👇 7) NOUVEAU : Détection de seuil et Alerte UART
-        // On vérifie si ça dépasse 300 ET si on n'a pas déjà crié il y a moins d'1 seconde
+        // --- DETEClON & SAUVEGARDE (NOUVEAU) ---
+
+        // Si seuil dépassé ET délai de 2s passé (anti-spam)
         if ((calc_rms_x > SEISMIC_THRESHOLD || calc_rms_y > SEISMIC_THRESHOLD || calc_rms_z > SEISMIC_THRESHOLD)
-             && (HAL_GetTick() - last_alert_time > 1000))
+             && (HAL_GetTick() - last_alert_time > 2000))
         {
-            char alert_msg[100];
-            // On affiche le message avec la valeur max détectée pour info
+            // Trouver l'intensité max parmi les 3 axes
             float max_val = calc_rms_x;
             if(calc_rms_y > max_val) max_val = calc_rms_y;
             if(calc_rms_z > max_val) max_val = calc_rms_z;
 
+            // 1. Lire l'heure actuelle du séisme
+            uint8_t h, m, s;
+            RTC_GetTime(&h, &m, &s);
+
+            // 2. Créer le "Souvenir"
+            SeismicEvent evt;
+            evt.hour = h;
+            evt.min = m;
+            evt.sec = s;
+            evt.intensity = max_val;
+
+            // 3. Sauvegarder dans la FRAM (Mémoire non volatile)
+            // On écrit la structure à l'adresse 0x10
+            FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(SeismicEvent));
+
+            // 4. Alerte UART (Avec confirmation de sauvegarde)
+            char alert_msg[128];
             int len = snprintf(alert_msg, sizeof(alert_msg),
-                               "\r\n>>> ⚠️ TREMBLEMENT DETECTE ! (Intensite: %.0f) <<<\r\n", max_val);
+                               "\r\n>>> ⚠️ ALERTE SISMIQUE ! <<<\r\n"
+                               "Heure: %02d:%02d:%02d | Intensite: %.0f\r\n"
+                               "-> Sauvegarde en FRAM OK.\r\n",
+                               h, m, s, max_val);
 
-            // Note: C'est mieux d'utiliser un Mutex sur l'UART si possible,
-            // mais ici HAL_UART_Transmit est "thread-safe" par défaut sur STM32 (il bloque).
             HAL_UART_Transmit(&huart3, (uint8_t*)alert_msg, len, 100);
-
-            // On allume la LED Rouge (LD3) pour le fun, si tu veux !
-            HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+            HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET); // LED Rouge ON
 
             last_alert_time = HAL_GetTick();
         }
-        else if (HAL_GetTick() - last_alert_time > 1000)
+        else if (HAL_GetTick() - last_alert_time > 2000)
         {
-             // On éteint la LED Rouge si tout est calme
-             HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+             HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET); // LED Rouge OFF
         }
 
-        // Gestion de l'index circulaire
         buffer_idx = (buffer_idx + 1) % WINDOW_SIZE;
     }
 }
@@ -1000,6 +1131,80 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 }
 
 
+// --- OUTILS CONVERSION (Le RTC parle en BCD, nous en Décimal) ---
+// Exemple : 45 secondes -> 0x45 (BCD)
+uint8_t decToBcd(int val) { return (uint8_t)((val/10*16) + (val%10)); }
+int bcdToDec(uint8_t val) { return (int)((val/16*10) + (val%16)); }
+
+// --- DRIVER RTC (BQ32000 via I2C1) ---
+
+
+void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec)
+{
+    uint8_t data[3];
+    data[0] = decToBcd(sec); // Registre 0x00 : Secondes
+    data[1] = decToBcd(min); // Registre 0x01 : Minutes
+    data[2] = decToBcd(hour); // Registre 0x02 : Heures
+
+    // On écrit à partir de l'adresse mémoire 0x00 du RTC
+    HAL_I2C_Mem_Write(&hi2c1, RTC_ADDR, 0x00, 1, data, 3, 1000);
+}
+
+void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec)
+{
+    uint8_t data[3];
+    // On lit 3 octets à partir de l'adresse 0x00
+    HAL_I2C_Mem_Read(&hi2c1, RTC_ADDR, 0x00, 1, data, 3, 1000);
+
+    *sec  = bcdToDec(data[0] & 0x7F); // Masque pour ignorer le bit d'arrêt
+    *min  = bcdToDec(data[1]);
+    *hour = bcdToDec(data[2]);
+}
+
+// --- DRIVER FRAM (CY15B104Q via SPI2) ---
+
+
+// Fonction interne pour activer l'écriture (WREN)
+void FRAM_WriteEnable(void)
+{
+    uint8_t cmd = FRAM_WREN;
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low (Active)
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High (Inactive)
+}
+
+void FRAM_Write(uint32_t addr, uint8_t *pData, uint16_t size)
+{
+    FRAM_WriteEnable(); // Indispensable avant chaque écriture !
+
+    uint8_t cmd[4];
+    cmd[0] = FRAM_WRITE;
+    // La FRAM a des adresses sur 3 octets (24 bits)
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);       // Envoi Commande + Adresse
+    HAL_SPI_Transmit(&hspi2, pData, size, 100);  // Envoi Données
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High
+}
+
+void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size)
+{
+    uint8_t cmd[4];
+    cmd[0] = FRAM_READ;
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);       // Envoi Commande + Adresse
+    HAL_SPI_Receive(&hspi2, pData, size, 100);   // Lecture Données
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High
+}
+
+
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -1016,38 +1221,68 @@ void StartDefaultTask(void const * argument)
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
   uint8_t system_running = 0; // Drapeau d'état système
+  //une fois
+  //mettre à lehure ici
+  //RTC_SetTime(16, 30, 24); // On force l'heure à midi pile
 
   for(;;)
-  {
-    // 💡 Détection de l'appui bouton (Actif Haut)
-    if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET)
     {
-      osDelay(50); // anti-rebond simple
-      while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET); // Attente relâchement
+      if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET)
+      {
+        osDelay(50);
+        while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
 
-      // Bascule de l'état
-      if (!system_running) {
-        system_running = 1;
-        HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM STARTED\r\n", 16, HAL_MAX_DELAY);
-        // 💡 RÉVEIL de toutes les tâches
-        osThreadResume(heartBeatTaskHandle);
-        osThreadResume(presenceTaskHandle);
-        osThreadResume(logMessageTaskHandle);
-        osThreadResume(seismicTaskHandle);
-        osThreadResume(clientTaskHandle);
-      } else {
-        system_running = 0;
-        HAL_UART_Transmit(&huart3, (uint8_t*)"SYSTEM STOPPED\r\n", 16, HAL_MAX_DELAY);
-        // 💡 Mise en PAUSE de toutes les tâches
-        osThreadSuspend(heartBeatTaskHandle);
-        osThreadSuspend(presenceTaskHandle);
-        osThreadSuspend(logMessageTaskHandle);
-        osThreadSuspend(seismicTaskHandle);
-        osThreadSuspend(clientTaskHandle);
+        if (!system_running) {
+          system_running = 1;
+          HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
+
+          // ==========================================
+          // 🕵️ LECTURE DE LA BOITE NOIRE (FRAM)
+          // ==========================================
+          char debug_msg[128];
+
+          // 1. Afficher l'heure actuelle
+          uint8_t h, m, s;
+          RTC_GetTime(&h, &m, &s);
+          sprintf(debug_msg, "🕒 Heure Actuelle: %02d:%02d:%02d\r\n", h, m, s);
+          HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+
+          // 2. Vérifier s'il y a un historique de crash en mémoire
+          SeismicEvent last_event;
+          // On lit la structure depuis l'adresse 0x10
+          FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last_event, sizeof(SeismicEvent));
+
+          // Si l'intensité est > 0, c'est qu'il y a un enregistrement
+          if (last_event.intensity > 0.0f && last_event.intensity < 10000.0f) {
+              sprintf(debug_msg, "💾 DERNIER SEISME ENREGISTRE :\r\n"
+                                 "   - Heure : %02d:%02d:%02d\r\n"
+                                 "   - Force : %.2f\r\n",
+                                 last_event.hour, last_event.min, last_event.sec, last_event.intensity);
+          } else {
+              sprintf(debug_msg, "💾 Aucun seisme en memoire (ou memoire vide).\r\n");
+          }
+          HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+          // ==========================================
+
+          osThreadResume(heartBeatTaskHandle);
+          osThreadResume(presenceTaskHandle);
+          osThreadResume(logMessageTaskHandle);
+          osThreadResume(seismicTaskHandle);
+          osThreadResume(clientTaskHandle);
+
+        } else {
+          // ... (Code d'arrêt inchangé) ...
+          system_running = 0;
+          HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STOPPED <<<\r\n", 26, 100);
+          osThreadSuspend(heartBeatTaskHandle);
+          osThreadSuspend(presenceTaskHandle);
+          osThreadSuspend(logMessageTaskHandle);
+          osThreadSuspend(seismicTaskHandle);
+          osThreadSuspend(clientTaskHandle);
+        }
       }
+      osDelay(100);
     }
-    osDelay(100);
-  }
 
 
   /* USER CODE END 5 */
