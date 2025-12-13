@@ -30,6 +30,7 @@
 #include <string.h>
 #include <math.h>
 #include "lwip/tcp.h"
+#include <time.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -72,6 +73,7 @@ osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
 
+
 osThreadId presenceTaskHandle; // handle de la tâche de présence
 uint16_t adc_raw[3];           // 💡 Buffer rempli automatiquement par le DMA (X, Y, Z)
 
@@ -104,6 +106,23 @@ typedef struct {
 } SeismicEvent;
 
 #define FRAM_EVENT_ADDR 0x10
+
+
+// --- ETAPE 3 : INTELLIGENCE COLLECTIVE ---
+volatile uint8_t my_alert_status = 0;       // 0=Calme, 1=Je tremble
+volatile uint8_t neighbor_alert_status = 0; // 0=Voisin Calme, 1=Voisin tremble
+
+float neighbor_peaks[10];
+uint8_t neighbor_idx = 0;
+// --- ETAPE 3 : CONFIG NTP ---
+#define NTP_SERVER_IP "216.239.35.0" // IP d'un serveur be.pool.ntp.org // utilisrer le serceur google
+#define NTP_PORT 123
+#define NTP_MSG_LEN 48
+// Différence entre 1900 (Epoch NTP) et 1970 (Epoch Unix) en secondes
+#define NTP_TIMESTAMP_DELTA 2208988800u
+
+#define TIMEZONE_OFFSET 1
+volatile uint8_t ntp_synced = 0; // Drapeau : 0 = Pas à l'heure, 1 = À l'heure
 
 /* USER CODE END PV */
 
@@ -148,6 +167,8 @@ void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec);
 /* Fonctions FRAM (Gestion Mémoire) */
 void FRAM_Write(uint32_t addr, uint8_t *pData, uint16_t size);
 void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size);
+
+void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port);
 
 /* USER CODE END PFP */
 
@@ -239,19 +260,19 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 256);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 2048);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of logMessageTask */
-  osThreadDef(logMessageTask, LogMessageTask, osPriorityNormal, 0, 256);
+  osThreadDef(logMessageTask, LogMessageTask, osPriorityNormal, 0, 512);
   logMessageTaskHandle = osThreadCreate(osThread(logMessageTask), NULL);
 
   /* definition and creation of clientTask */
-  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 1024);
   clientTaskHandle = osThreadCreate(osThread(clientTask), NULL);
 
   /* definition and creation of serverTask */
-  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 1024);
   serverTaskHandle = osThreadCreate(osThread(serverTask), NULL);
 
   /* definition and creation of heartBeatTask */
@@ -261,14 +282,14 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   /* definition and creation of presenceTask */
   // 💡 Tâche Présence : Envoie un message UDP "Je suis là" à tout le monde
-  osThreadDef(presenceTask, StartPresenceTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(presenceTask, StartPresenceTask, osPriorityBelowNormal, 0, 512);
   presenceTaskHandle = osThreadCreate(osThread(presenceTask), NULL);
   /* add threads, ... */
 
 
   /* definition and creation of seismicTask */
   // 💡 Tâche Sismique : Priorité ÉLEVÉE car calcul critique en temps réel
-  osThreadDef(seismicTask, StartSeismicTask, osPriorityAboveNormal, 0, 512);
+  osThreadDef(seismicTask, StartSeismicTask, osPriorityAboveNormal, 0, 2048);
   seismicTaskHandle = osThreadCreate(osThread(seismicTask), NULL);
 
 
@@ -841,88 +862,94 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
   * @brief Tâche de traitement du signal sismique
   * @note  Lit les valeurs brutes, filtre (moyenne) et calcule l'énergie (RMS)
   */
-void StartSeismicTask(void const * argument)
+void StartSeismicTask(void const * argument) //lle inclut une "mémoire" de 3 secondes.
 {
-    // Init buffers
-    memset(buf_x, 0, sizeof(buf_x));
-    memset(buf_y, 0, sizeof(buf_y));
-    memset(buf_z, 0, sizeof(buf_z));
+    memset(buf_x,0,sizeof(buf_x)); memset(buf_y,0,sizeof(buf_y)); memset(buf_z,0,sizeof(buf_z));
     int buffer_idx = 0;
-    uint32_t last_alert_time = 0;
 
-    for(;;)
-    {
-        // Synchro ADC (100Hz)
+    // Variables de temps
+    uint32_t last_tremor_time = 0; // Moment du dernier RMS > 300
+    uint32_t last_print_time = 0;  // Pour éviter le spam UART
+    uint32_t last_save_time = 0;   // Pour l'écriture FRAM
+
+    char msg[100];
+
+    for(;;) {
         osSemaphoreWait(adcReadySemHandle, osWaitForever);
 
-        // Lecture Raw
-        float raw_x = (float)adc_raw[0];
-        float raw_y = (float)adc_raw[1];
-        float raw_z = (float)adc_raw[2];
-        buf_x[buffer_idx] = raw_x; buf_y[buffer_idx] = raw_y; buf_z[buffer_idx] = raw_z;
+        // --- 1. Calcul RMS (inchangé) ---
+        float raw_x = adc_raw[0], raw_y = adc_raw[1], raw_z = adc_raw[2];
+        buf_x[buffer_idx]=raw_x; buf_y[buffer_idx]=raw_y; buf_z[buffer_idx]=raw_z;
 
-        // Calcul Moyenne
-        float mean_x = 0, mean_y = 0, mean_z = 0;
+        float mean_x=0, mean_y=0, mean_z=0;
         for(int i=0; i<WINDOW_SIZE; i++) { mean_x+=buf_x[i]; mean_y+=buf_y[i]; mean_z+=buf_z[i]; }
         mean_x/=WINDOW_SIZE; mean_y/=WINDOW_SIZE; mean_z/=WINDOW_SIZE;
 
-        // Calcul Variance
-        float var_x = 0, var_y = 0, var_z = 0;
+        float var_x=0, var_y=0, var_z=0;
         for(int i=0; i<WINDOW_SIZE; i++) {
              var_x+=powf(buf_x[i]-mean_x,2); var_y+=powf(buf_y[i]-mean_y,2); var_z+=powf(buf_z[i]-mean_z,2);
         }
-        // Calcul RMS (Ecart-Type)
         float calc_rms_x = sqrtf(var_x/WINDOW_SIZE);
         float calc_rms_y = sqrtf(var_y/WINDOW_SIZE);
         float calc_rms_z = sqrtf(var_z/WINDOW_SIZE);
 
-        // Mise à jour sécurisée des globales
+        // Mise à jour variables globales protégées
         osMutexWait(dataMutexHandle, osWaitForever);
         rms_x = calc_rms_x; rms_y = calc_rms_y; rms_z = calc_rms_z;
         osMutexRelease(dataMutexHandle);
 
-        // --- DETEClON & SAUVEGARDE (NOUVEAU) ---
 
-        // Si seuil dépassé ET délai de 2s passé (anti-spam)
-        if ((calc_rms_x > SEISMIC_THRESHOLD || calc_rms_y > SEISMIC_THRESHOLD || calc_rms_z > SEISMIC_THRESHOLD)
-             && (HAL_GetTick() - last_alert_time > 2000))
-        {
-            // Trouver l'intensité max parmi les 3 axes
-            float max_val = calc_rms_x;
-            if(calc_rms_y > max_val) max_val = calc_rms_y;
-            if(calc_rms_z > max_val) max_val = calc_rms_z;
+        // --- 2. Logique de Détection Améliorée ---
 
-            // 1. Lire l'heure actuelle du séisme
-            uint8_t h, m, s;
-            RTC_GetTime(&h, &m, &s);
+        // Est-ce qu'on tremble MAINTENANT ?
+        if (calc_rms_x > SEISMIC_THRESHOLD || calc_rms_y > SEISMIC_THRESHOLD || calc_rms_z > SEISMIC_THRESHOLD) {
 
-            // 2. Créer le "Souvenir"
-            SeismicEvent evt;
-            evt.hour = h;
-            evt.min = m;
-            evt.sec = s;
-            evt.intensity = max_val;
+            my_alert_status = 1; // 🚨 ON PASSE EN ALERTE
+            last_tremor_time = HAL_GetTick(); // On remet le chrono à zéro
 
-            // 3. Sauvegarder dans la FRAM (Mémoire non volatile)
-            // On écrit la structure à l'adresse 0x10
-            FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(SeismicEvent));
+            // Anti-Spam UART : On affiche seulement toutes les 500ms
+            if (HAL_GetTick() - last_print_time > 500) {
+                float max_val = (calc_rms_x > calc_rms_y) ? calc_rms_x : calc_rms_y;
+                sprintf(msg, "⚠️ TREMBLEMENT LOCAL (RMS: %.0f)\r\n", max_val);
+                //affichage heure durant lla secousse
+                uint8_t h, m, s;
 
-            // 4. Alerte UART (Avec confirmation de sauvegarde)
-            char alert_msg[128];
-            int len = snprintf(alert_msg, sizeof(alert_msg),
-                               "\r\n>>> ⚠️ ALERTE SISMIQUE ! <<<\r\n"
-                               "Heure: %02d:%02d:%02d | Intensite: %.0f\r\n"
-                               "-> Sauvegarde en FRAM OK.\r\n",
-                               h, m, s, max_val);
+                RTC_GetTime(&h, &m, &s);
+                sprintf(msg, "[%02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL (RMS: %.0f)\r\n", h, m, s, max_val);
+                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                last_print_time = HAL_GetTick();
+            }
 
-            HAL_UART_Transmit(&huart3, (uint8_t*)alert_msg, len, 100);
-            HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET); // LED Rouge ON
+            // Sauvegarde FRAM (toutes les 2s max)
+            if (HAL_GetTick() - last_save_time > 2000) {
+                float max_val = calc_rms_x;
+                if(calc_rms_y > max_val) max_val = calc_rms_y;
+                if(calc_rms_z > max_val) max_val = calc_rms_z;
 
-            last_alert_time = HAL_GetTick();
+                uint8_t h, m, s; RTC_GetTime(&h, &m, &s);
+                SeismicEvent evt; evt.hour=h; evt.min=m; evt.sec=s; evt.intensity=max_val;
+                FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(SeismicEvent));
+                HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET); // LED Rouge Fixe
+                last_save_time = HAL_GetTick();
+            }
         }
-        else if (HAL_GetTick() - last_alert_time > 2000)
-        {
-             HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET); // LED Rouge OFF
+        else {
+            // C'est calme maintenant.
+            // MAIS on garde l'alerte active pendant 3 secondes après la dernière secousse !
+            if (HAL_GetTick() - last_tremor_time > 3000) {
+                if (my_alert_status == 1) {
+                     // Fin de l'alerte
+                     my_alert_status = 0;
+                     HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+                     HAL_UART_Transmit(&huart3, (uint8_t*)"✅ Fin de l'alerte locale.\r\n", 30, 100);
+                }
+            }
+        }
+
+        // --- 3. Consensus (Alerte Collective) ---
+        // Si JE tremble (ou j'ai tremblé il y a <3s) ET le VOISIN tremble
+        if (my_alert_status == 1 && neighbor_alert_status == 1) {
+             HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // Clignotement panique
         }
 
         buffer_idx = (buffer_idx + 1) % WINDOW_SIZE;
@@ -966,73 +993,33 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 }
 
 // 💡 Callback appelée quand des données arrivent sur le serveur
-err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
-{
-    if (err != ERR_OK)
-    {
-        if (p) pbuf_free(p);
-        return err;
-    }
+err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    if (err!=ERR_OK || p==NULL) { if(p) pbuf_free(p); tcp_close(tpcb); return ERR_OK; }
 
-    // 💡 Si p == NULL, cela signifie que le client a fermé la connexion
-    if (p == NULL)
-    {
-        tcp_close(tpcb);
-        return ERR_OK;
-    }
-
-    // Buffer local pour impression
     char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-
-    // Copie sécurisée des données
-    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
-    memcpy(buffer, p->payload, len);
-    buffer[len] = 0;
-
-    // 🔥 LOG UART : afficher tout ce qui arrive
-    char msg[300];
-    snprintf(msg, sizeof(msg),
-             "📩 RECU DE %s : %s\r\n",
-             ipaddr_ntoa(&tpcb->remote_ip),
-             buffer);
-
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-    // 💡 Indiquer à LwIP qu'on a bien traité les données (pour libérer la fenêtre TCP)
+    uint16_t len = (p->len < sizeof(buffer)-1)?p->len:sizeof(buffer)-1;
+    memcpy(buffer, p->payload, len); buffer[len]=0;
     tcp_recved(tpcb, p->tot_len);
 
-    // --- Traitement logique ---
-    // Si la requête contient "data_request", on renvoie nos valeurs RMS
-    if (strstr(buffer, "\"data_request\""))
-    {
-    	// 💡 CORRECTION : Variables temporaires pour la lecture atomique
-    	        float tx_x, tx_y, tx_z;
+    if (strstr(buffer, "\"data_request\"")) {
+        float tx_x, tx_y, tx_z;
+        osMutexWait(dataMutexHandle, osWaitForever);
+        tx_x = rms_x; tx_y = rms_y; tx_z = rms_z;
+        osMutexRelease(dataMutexHandle);
 
-    	        // On verrouille le Mutex pour lire proprement
-    	        osMutexWait(dataMutexHandle, osWaitForever);
-    	        tx_x = rms_x;
-    	        tx_y = rms_y;
-    	        tx_z = rms_z;
-    	        osMutexRelease(dataMutexHandle);
+        char response[300];
+        // Format JSON conforme PDF avec statut dynamique
+        snprintf(response, sizeof(response),
+                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+                "\"timestamp\": \"2025-10-02T...\", "
+                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+                "\"status\": \"%s\" }",
+                tx_x, tx_y, tx_z, my_alert_status ? "alert" : "normal");
 
-    	        char response[256];
-    	        int resp_len = snprintf(response, sizeof(response),
-    	                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-    	                "\"timestamp\": \"2025-10-02T08:21:01Z\", "
-    	                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-    	                "\"status\": \"normal\" }",
-    	                tx_x, tx_y, tx_z); // On utilise les copies locales
-
-        // Envoi de la réponse
-        tcp_write(tpcb, response, resp_len, TCP_WRITE_FLAG_COPY);
-        // Force l'envoi immédiat
+        tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
         tcp_output(tpcb);
-        // Fermeture de la connexion (modèle requête/réponse simple)
         tcp_close(tpcb);
     }
-
-    // Libération du buffer de réception
     pbuf_free(p);
     return ERR_OK;
 }
@@ -1094,39 +1081,32 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
     return ERR_OK;
 }
 
-err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
-{
-    if (err != ERR_OK) {
-        if (p) pbuf_free(p);
-        return err;
-    }
+err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
+    if (err!=ERR_OK || p==NULL) { if(p) pbuf_free(p); tcp_close(tpcb); return ERR_OK; }
 
-    if (p == NULL) {
-        // Le serveur a fermé la connexion
-        tcp_close(tpcb);
-        return ERR_OK;
-    }
-
-    // Lecture des données reçues
-    char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
-    memcpy(buffer, p->payload, len);
-    buffer[len] = 0;
-
-    // 💡 Affichage de la réponse du voisin (Acceleration X, Y, Z)
-    // C'est ici que tu valides l'exigence "Récupérer leurs données"
-    char msg[300];
-    snprintf(msg, sizeof(msg), "✅ REPONSE REÇUE : %s\r\n", buffer);
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-    // Acquittement LwIP
+    char buffer[512];
+    uint16_t len = (p->len < sizeof(buffer)-1)?p->len:sizeof(buffer)-1;
+    memcpy(buffer, p->payload, len); buffer[len]=0;
     tcp_recved(tpcb, p->tot_len);
 
-    // Une fois la réponse reçue, on peut fermer proprement
-    pbuf_free(p);
-    tcp_close(tpcb);
+    // Analyse Voisin
+    if (strstr(buffer, "\"status\": \"alert\"")) {
+        neighbor_alert_status = 1;
+        HAL_UART_Transmit(&huart3, (uint8_t*)"⚠️ VOISIN EN ALERTE !\r\n", 24, 100);
+        neighbor_peaks[neighbor_idx] = 999.0f;
+        neighbor_idx = (neighbor_idx + 1) % 10;
+    } else {
+        neighbor_alert_status = 0;
+        // --- CORRECTION : AJOUT LOG CONNECTION REUSSIE ---
+        // Affiche un petit message pour confirmer qu'on a bien reçu la réponse du voisin
+        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ Voisin calme (Ping OK)\r\n", 28, 100);
+    }
 
+    if (my_alert_status && neighbor_alert_status) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n", 54, 100);
+    }
+
+    pbuf_free(p); tcp_close(tpcb);
     return ERR_OK;
 }
 
@@ -1204,6 +1184,89 @@ void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size)
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High
 }
 
+//fonction qui appele quand le serveur répond
+void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
+{
+    if (p != NULL && p->tot_len >= 48) // Un paquet NTP fait 48 octets min
+    {
+        // Le timestamp se trouve à l'octet 40 du paquet NTP
+        uint8_t *payload = (uint8_t *)p->payload;
+
+        // Les données arrivent en Big Endian, il faut les reconstruire
+        uint32_t ntp_seconds = (payload[40] << 24) | (payload[41] << 16) | (payload[42] << 8) | payload[43];
+
+        // 1. Convertir NTP (1900) vers UNIX (1970)
+        // On soustrait 2 208 988 800 secondes
+        uint32_t unix_time = ntp_seconds - NTP_TIMESTAMP_DELTA;
+
+        // 2. Appliquer le fuseau horaire (Belgique)
+        unix_time += (TIMEZONE_OFFSET * 3600);
+
+        // 3. Calculer Heure/Minute/Seconde (Maths simples modulo)
+        uint8_t h = (unix_time / 3600) % 24;
+        uint8_t m = (unix_time / 60) % 60;
+        uint8_t s = unix_time % 60;
+
+        // 4. Mettre à jour le RTC hardware
+        RTC_SetTime(h, m, s);
+        ntp_synced = 1;
+        // 5. Feedback UART
+        char msg[64];
+        sprintf(msg, "✅ HEURE SYNC NTP : %02d:%02d:%02d\r\n", h, m, s);
+        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+    }
+
+    // Nettoyage indispensable
+    pbuf_free(p);
+    udp_remove(pcb); // On ferme la connexion une fois l'heure reçue
+}
+
+// Fonction pour demander l'heure au serveur NTP
+void Sync_Time_NTP(void)
+{
+    struct udp_pcb *pcb;
+    struct pbuf *p;
+    ip_addr_t dest_ip;
+    err_t err;
+
+    HAL_UART_Transmit(&huart3, (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n", 44, 100);
+
+    pcb = udp_new();
+    if (!pcb) return;
+
+    // 💡 IMPORTANT : On dit à LwIP quelle fonction appeler quand une réponse arrive
+    udp_recv(pcb, ntp_recv_callback, NULL);
+
+    // IP Belge (be.pool.ntp.org -> exemple 85.201.16.177 ou 193.191.177.6)
+    // Si tu veux changer, assure-toi que l'IP est valide. Celle de ton code est OK.
+    ipaddr_aton(NTP_SERVER_IP, &dest_ip);
+
+    // Création du paquet NTP
+    uint8_t *buff = (uint8_t *)mem_malloc(NTP_MSG_LEN);
+    if (!buff) { udp_remove(pcb); return; }
+
+    memset(buff, 0, NTP_MSG_LEN);
+    buff[0] = 0x1B; // LI=0, VN=3, Mode=3 (Client)
+
+    p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
+    if (!p) { mem_free(buff); udp_remove(pcb); return; }
+
+    memcpy(p->payload, buff, NTP_MSG_LEN);
+    mem_free(buff);
+
+    // Envoi de la requête
+    err = udp_sendto(pcb, p, &dest_ip, NTP_PORT);
+    pbuf_free(p);
+
+    if (err == ERR_OK) {
+        // On ne ferme PAS le pcb ici ! On attend la réponse dans la callback.
+        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ NTP: Requete envoyee, attente...\r\n", 38, 100);
+    } else {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur envoi.\r\n", 22, 100);
+        udp_remove(pcb); // Si l'envoi échoue, on ferme tout de suite
+    }
+}
+
 
 /* USER CODE END 4 */
 
@@ -1220,70 +1283,100 @@ void StartDefaultTask(void const * argument)
   MX_LWIP_Init();
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
-  uint8_t system_running = 0; // Drapeau d'état système
+  //uint8_t system_running = 0; // Drapeau d'état système
   //une fois
   //mettre à lehure ici
-  //RTC_SetTime(16, 30, 24); // On force l'heure à midi pile
+  //RTC_SetTime(17, 21, 24); // On force l'heure à midi pile
 
-  for(;;)
-    {
-      if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET)
-      {
-        osDelay(50);
-        while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+  // Demande NTP au démarrage (Etape 3)
 
-        if (!system_running) {
-          system_running = 1;
-          HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
+  extern struct netif gnetif;
+    char msg[60];
 
-          // ==========================================
-          // 🕵️ LECTURE DE LA BOITE NOIRE (FRAM)
-          // ==========================================
-          char debug_msg[128];
-
-          // 1. Afficher l'heure actuelle
-          uint8_t h, m, s;
-          RTC_GetTime(&h, &m, &s);
-          sprintf(debug_msg, "🕒 Heure Actuelle: %02d:%02d:%02d\r\n", h, m, s);
-          HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
-
-          // 2. Vérifier s'il y a un historique de crash en mémoire
-          SeismicEvent last_event;
-          // On lit la structure depuis l'adresse 0x10
-          FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last_event, sizeof(SeismicEvent));
-
-          // Si l'intensité est > 0, c'est qu'il y a un enregistrement
-          if (last_event.intensity > 0.0f && last_event.intensity < 10000.0f) {
-              sprintf(debug_msg, "💾 DERNIER SEISME ENREGISTRE :\r\n"
-                                 "   - Heure : %02d:%02d:%02d\r\n"
-                                 "   - Force : %.2f\r\n",
-                                 last_event.hour, last_event.min, last_event.sec, last_event.intensity);
-          } else {
-              sprintf(debug_msg, "💾 Aucun seisme en memoire (ou memoire vide).\r\n");
-          }
-          HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
-          // ==========================================
-
-          osThreadResume(heartBeatTaskHandle);
-          osThreadResume(presenceTaskHandle);
-          osThreadResume(logMessageTaskHandle);
-          osThreadResume(seismicTaskHandle);
-          osThreadResume(clientTaskHandle);
-
-        } else {
-          // ... (Code d'arrêt inchangé) ...
-          system_running = 0;
-          HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STOPPED <<<\r\n", 26, 100);
-          osThreadSuspend(heartBeatTaskHandle);
-          osThreadSuspend(presenceTaskHandle);
-          osThreadSuspend(logMessageTaskHandle);
-          osThreadSuspend(seismicTaskHandle);
-          osThreadSuspend(clientTaskHandle);
-        }
-      }
-      osDelay(100);
+    // --- 1. ATTENTE RESEAU ---
+    HAL_UART_Transmit(&huart3, (uint8_t*)"⏳ Attente IP DHCP...\r\n", 24, 100);
+    while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) {
+        osDelay(500);
     }
 
+    sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+
+    // --- 2. SYNCHRO NTP ---
+    int retry_count = 0;
+    while (ntp_synced == 0) {
+        Sync_Time_NTP();
+        // On attend 2 secondes la réponse
+        for(int i=0; i<20; i++) {
+            osDelay(100);
+            if(ntp_synced) break;
+        }
+        if(ntp_synced == 0) {
+            retry_count++;
+            sprintf(msg, "⚠️ Pas de reponse NTP, tentative %d...\r\n", retry_count);
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+        }
+    }
+
+    // --- 3. SYSTEME PRET ---
+    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n", 44, 100);
+
+    uint8_t system_running = 0; // Variable d'état
+
+    for(;;) {
+        // Détection Bouton Bleu
+        if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
+          // Anti-rebond
+          osDelay(50);
+          while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
+
+          if (!system_running) {
+            // --- DEMARRAGE ---
+            system_running = 1;
+            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
+
+            // Affichage de l'heure actuelle
+            uint8_t h, m, s; RTC_GetTime(&h, &m, &s);
+            sprintf(msg, "🕒 Heure systeme : %02d:%02d:%02d\r\n", h, m, s);
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+
+            			SeismicEvent last;
+                      // On met tout à 0 par sécurité avant de lire
+                      memset(&last, 0, sizeof(SeismicEvent));
+
+                      FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
+
+                      // Vérification de sécurité : Est-ce que les données semblent valides ?
+                      // (Intensité réaliste et heure cohérente 0-23h)
+                      if(last.intensity > 1.0f && last.intensity < 20000.0f && last.hour < 24) {
+                          sprintf(msg, "💾 DERNIER SEISME : %02d:%02d:%02d (Force: %.0f)\r\n", last.hour, last.min, last.sec, last.intensity);
+                      } else {
+                          sprintf(msg, "💾 Pas de seisme valide en memoire.\r\n");
+                      }
+                      HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+
+            // Réveil des tâches
+            osThreadResume(heartBeatTaskHandle);
+            osThreadResume(presenceTaskHandle);
+            osThreadResume(logMessageTaskHandle);
+            osThreadResume(seismicTaskHandle);
+            osThreadResume(clientTaskHandle);
+
+          } else {
+            // --- ARRET ---
+            system_running = 0;
+            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STOPPED <<<\r\n", 26, 100);
+
+            // Suspension des tâches
+            osThreadSuspend(heartBeatTaskHandle);
+            osThreadSuspend(presenceTaskHandle);
+            osThreadSuspend(logMessageTaskHandle);
+            osThreadSuspend(seismicTaskHandle);
+            osThreadSuspend(clientTaskHandle);
+          }
+        }
+        osDelay(100);
+    }
 
   /* USER CODE END 5 */
 }
@@ -1376,7 +1469,7 @@ void StartClientTask(void const * argument)
     	    send_data_request_tcp(node_list[i]);
     	    osDelay(200); // Petite pause pour ne pas saturer
     	}
-        osDelay(10000); // Pause longue (10s) avant le prochain cycle
+        osDelay(2000); // Pause longue (10s) avant le prochain cycle
     }
   /* USER CODE END StartClientTask */
 }
