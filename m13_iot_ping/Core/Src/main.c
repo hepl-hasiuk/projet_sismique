@@ -17,7 +17,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "main.h"
+#include "main.h"//20h22=13d2025
 #include "cmsis_os.h"
 #include "lwip.h"
 
@@ -26,10 +26,11 @@
 #include "lwip/udp.h"
 #include "lwip/pbuf.h"
 #include "lwip/ip_addr.h"
+#include "lwip/tcp.h"
+
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
-#include "lwip/tcp.h"
 #include <time.h>
 /* USER CODE END Includes */
 
@@ -40,9 +41,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define PRESENCE_PORT 12345 // même port que ton script Python
-#define WINDOW_SIZE 100     // 💡 Taille de la fenêtre pour le calcul de la moyenne (1s à 100Hz)
-#define SEISMIC_THRESHOLD 300.0f
+#define PRESENCE_PORT 12345 // Port utilisé pour le protocole de présence (broadcast UDP)
+#define WINDOW_SIZE 100     // Taille de la fenêtre pour le calcul du RMS (100 échantillons)
+#define SEISMIC_THRESHOLD 300.0f // Seuil de détection sismique (valeur RMS)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,56 +74,101 @@ osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
 
+/* -------------------------------------------------------------------------- */
+/*                  THREADS & BUFFERS LIES AUX CAPTEURS                       */
+/* -------------------------------------------------------------------------- */
 
-osThreadId presenceTaskHandle; // handle de la tâche de présence
-uint16_t adc_raw[3];           // 💡 Buffer rempli automatiquement par le DMA (X, Y, Z)
+/* Handle de la tâche présence réseau (Broadcast UDP) */
+osThreadId presenceTaskHandle;
 
-//seismic part
+/* Buffer contenant les 3 valeurs ADC brutes (X, Y, Z) */
+uint16_t adc_raw[3];
+
+/* -------------------------------------------------------------------------- */
+/*                           VARIABLES SISMIQUES                              */
+/* -------------------------------------------------------------------------- */
+
+/* Handle de la tâche sismique (calcul RMS + détection) */
 osThreadId seismicTaskHandle;
-// 💡 Variables pour le lissage (filtre passe-bas)
-float avg_x = 0, avg_y = 0, avg_z = 0;
-// 💡 Variables finales calculées (énergie du signal)
+
+/* Valeurs RMS calculées (niveau d'énergie par axe) */
 float rms_x = 0, rms_y = 0, rms_z = 0;
-// 💡 Historique des valeurs lissées pour le calcul RMS
+
+/* Buffers circulaires sur 1 seconde (100 échantillons) pour RMS */
 float buf_x[WINDOW_SIZE];
 float buf_y[WINDOW_SIZE];
 float buf_z[WINDOW_SIZE];
-//uint16_t idx = 0; // 💡 Index pour parcourir le tableau circulaire
 
-// Commandes SPI standards FRAM
+/* -------------------------------------------------------------------------- */
+/*                       DEFINITIONS FRAM & RTC I2C                           */
+/* -------------------------------------------------------------------------- */
+
+/* Adresse I2C du module RTC (type DS1307 / BQ32000) */
 #define RTC_ADDR 0xD0
-#define FRAM_WREN  0x06     // Write Enable (Autoriser écriture)
-#define FRAM_WRITE 0x02     // Write Data
-#define FRAM_READ  0x03     // Read Data
 
+/* Commandes SPI pour contrôle de la mémoire FRAM */
+#define FRAM_WREN        0x06   // Enable Write
+#define FRAM_WRITE       0x02   // Ecriture séquentielle
+#define FRAM_READ        0x03   // Lecture séquentielle
 
-// Structure pour stocker un événement (Taille = 8 octets)
+/* Adresse de stockage principal dans la FRAM (boîte noire) */
+#define FRAM_EVENT_ADDR  0x10
+
+/* Structure enregistrée dans la FRAM pour mémoriser un séisme */
 typedef struct {
-    uint8_t hour;
-    uint8_t min;
-    uint8_t sec;
-    uint8_t reserved; // Juste pour aligner la mémoire
-    float intensity;  // La valeur RMS max
+    uint8_t hour;       // Heure de l'évènement
+    uint8_t min;        // Minute
+    uint8_t sec;        // Seconde
+    uint8_t reserved;   // Alignement mémoire (non utilisé)
+    float intensity;    // RMS maximale détectée
 } SeismicEvent;
 
-#define FRAM_EVENT_ADDR 0x10
+/* -------------------------------------------------------------------------- */
+/*                       INTELLIGENCE COLLECTIVE (ÉTAPE 3)                    */
+/* -------------------------------------------------------------------------- */
 
+/*
+ * États de détection :
+ *   - my_alert_status       → Ce nœud détecte une secousse ?
+ *   - neighbor_alert_status → Un voisin a déclaré une alerte ?
+ *
+ * Ces deux variables permettent la validation collective :
+ *   ALERTE = moi_en_alerte && voisin_en_alerte
+ */
+volatile uint8_t my_alert_status = 0;
+volatile uint8_t neighbor_alert_status = 0;
 
-// --- ETAPE 3 : INTELLIGENCE COLLECTIVE ---
-volatile uint8_t my_alert_status = 0;       // 0=Calme, 1=Je tremble
-volatile uint8_t neighbor_alert_status = 0; // 0=Voisin Calme, 1=Voisin tremble
-
-float neighbor_peaks[10];
+/*
+ * Historique des 10 valeurs maximales (demande du professeur) :
+ *   - neighbor_peaks[] → Ce qu’on a reçu des voisins
+ *   - local_peaks[]    → Ce que nous avons détecté localement
+ */
+float neighbor_peaks[10] = {0};
 uint8_t neighbor_idx = 0;
-// --- ETAPE 3 : CONFIG NTP ---
-#define NTP_SERVER_IP "216.239.35.0" // IP d'un serveur be.pool.ntp.org // utilisrer le serceur google
+
+float local_peaks[10] = {0};
+uint8_t local_idx = 0;
+
+/* -------------------------------------------------------------------------- */
+/*                    CONFIGURATION NTP (Synchronisation RTC)                 */
+/* -------------------------------------------------------------------------- */
+
+/* Serveur NTP utilisé (Google : fiable + répond vite) */
+#define NTP_SERVER_IP "216.239.35.0"
+
+/* Paramètres standard du protocole NTP */
 #define NTP_PORT 123
 #define NTP_MSG_LEN 48
-// Différence entre 1900 (Epoch NTP) et 1970 (Epoch Unix) en secondes
-#define NTP_TIMESTAMP_DELTA 2208988800u
+#define NTP_TIMESTAMP_DELTA 2208988800u   // Conversion NTP → UNIX
+#define TIMEZONE_OFFSET 1                 // UTC+1 (Belgique)
 
-#define TIMEZONE_OFFSET 1
-volatile uint8_t ntp_synced = 0; // Drapeau : 0 = Pas à l'heure, 1 = À l'heure
+/* État de synchronisation :
+ *   0 → RTC pas encore mis à l'heure
+ *   1 → Heure synchronisée
+ */
+volatile uint8_t ntp_synced = 0;
+
+
 
 /* USER CODE END PV */
 
@@ -143,33 +189,88 @@ void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
+/* -------------------------------------------------------------------------- */
+/*                     PROTOTYPES — TÂCHES FREE RTOS                          */
+/* -------------------------------------------------------------------------- */
+
+/* Tâche de présence réseau : envoie périodiquement un broadcast UDP */
 void StartPresenceTask(void const * argument);
+
+/* Fonction qui fabrique et envoie le JSON "presence" */
 void send_presence_broadcast(void);
+
+/* Tâche principale du module sismique :
+   - attend les échantillons ADC via sémaphore
+   - calcule RMS
+   - détecte les secousses
+*/
 void StartSeismicTask(void const * argument);
-/*server*/
+
+/* -------------------------------------------------------------------------- */
+/*                       PROTOTYPES — SERVEUR TCP                             */
+/* -------------------------------------------------------------------------- */
+
+/* Initialise le serveur : bind + listen */
 void tcp_server_init(void);
+
+/* Callback : un client se connecte au serveur */
 err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
+
+/* Callback : le serveur reçoit un message (ex: data_request JSON) */
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 
+/* -------------------------------------------------------------------------- */
+/*                       PROTOTYPES — CLIENT TCP                              */
+/* -------------------------------------------------------------------------- */
+
+/* Fonction qui initie une connexion TCP vers une IP en particulier */
 void send_data_request_tcp(const char *ip);
+
+/* Callback : connexion réussie → on envoie un JSON data_request */
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err);
+
+/* Callback : réception de la réponse data_response d’un voisin */
 err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 
+/* -------------------------------------------------------------------------- */
+/*               OBJETS FREE RTOS (sémaphore + mutex)                         */
+/* -------------------------------------------------------------------------- */
+
+/* Sémaphore libéré par l'interruption ADC → réveille la tâche sismique */
 osSemaphoreId adcReadySemHandle;
+
+/* Mutex protégeant l'accès aux valeurs RMS partagées */
 osMutexId dataMutexHandle;
 
-/* Fonctions RTC (Gestion Heure) */
+/* -------------------------------------------------------------------------- */
+/*                          PROTOTYPES — RTC (I2C)                            */
+/* -------------------------------------------------------------------------- */
+
+/* Conversion utilitaires (le RTC utilise du BCD) */
 uint8_t decToBcd(int val);
 int bcdToDec(uint8_t val);
+
+/* Lecture & écriture de l’heure dans le module RTC */
 void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec);
 void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec);
 
-/* Fonctions FRAM (Gestion Mémoire) */
+/* -------------------------------------------------------------------------- */
+/*                     PROTOTYPES — FRAM (SPI)                                */
+/* -------------------------------------------------------------------------- */
+
 void FRAM_Write(uint32_t addr, uint8_t *pData, uint16_t size);
 void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size);
 
-void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port);
+/* -------------------------------------------------------------------------- */
+/*                      PROTOTYPES — NTP (UDP)                                */
+/* -------------------------------------------------------------------------- */
 
+/* Callback appelée quand un paquet NTP arrive (réponse du serveur) */
+void ntp_recv_callback(void *arg,
+                       struct udp_pcb *pcb,
+                       struct pbuf *p,
+                       const ip_addr_t *addr,
+                       u16_t port);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -293,8 +394,8 @@ int main(void)
   seismicTaskHandle = osThreadCreate(osThread(seismicTask), NULL);
 
 
-  /* 🚨 IMPORTANT : tout suspendre au début */
-  // 💡 Au démarrage, on met tout en pause. Seule la tâche par défaut tourne
+  /*  IMPORTANT : tout suspendre au début */
+  //  Au démarrage, on met tout en pause Seule la tâche par défaut tourne
   // pour attendre l'appui sur le bouton bleu.
   osThreadSuspend(heartBeatTaskHandle);
   osThreadSuspend(presenceTaskHandle);
@@ -768,190 +869,301 @@ static void MX_GPIO_Init(void)
 /**
   * @brief Tâche pour la découverte réseau (Protocole de présence)
   * @note  Envoie périodiquement un broadcast UDP pour dire "Je suis là"
+  * Cette tâche envoie régulièrement un message JSON "presence" afin
+  * de signaler l’existence du nœud sur le réseau local.
   */
 void StartPresenceTask(void const * argument)
 {
-  /* On attend que LwIP soit initialisé */
-  extern struct netif gnetif;
-  // 💡 Boucle d'attente : tant que le câble n'est pas branché ou l'IP non reçue
-  while (!netif_is_up(&gnetif))
-  {
-	  osDelay(100);
-  }
 
-  for(;;)
-  {
-    send_presence_broadcast(); // envoi du JSON en broadcast
-    osDelay(10000); // toutes les 10 secondes
-  }
+    /* Attendre que la pile réseau LwIP soit opérationnelle */
+    extern struct netif gnetif;
+
+    // On boucle tant que :
+    //   - la carte n'a pas obtenu d'adresse IP
+    //   - le câble Ethernet n'est pas connecté
+    while (!netif_is_up(&gnetif))
+    {
+        osDelay(100);
+    }
+
+    /* Boucle principale : envoi périodique du broadcast */
+    for (;;)
+    {
+        send_presence_broadcast();  // Envoi JSON presence
+        osDelay(10000);             // 10 secondes entre deux annonces
+    }
 }
 
 /**
   * @brief Fonction d'envoi du message UDP Broadcast
   * @note  Crée un socket UDP temporaire, envoie le JSON, puis ferme le socket.
+  *
+  * Étapes :
+  *   1. Création d’un PCB UDP (socket LwIP)
+  *   2. Activation du mode broadcast
+  *   3. Construction dynamique du JSON (IP réelle incluse)
+  *   4. Allocation d’un pbuf et copie des données
+  *   5. Envoi du paquet sur l’adresse 192.168.129.255
+  *   6. Libération du buffer et fermeture du PCB
   */
+
 void send_presence_broadcast(void)
 {
-  struct udp_pcb *pcb;
-  struct pbuf *p;
-  ip_addr_t dest_ip;
-  err_t err;
+    struct udp_pcb *pcb;
+    struct pbuf *p;
+    ip_addr_t dest_ip;
 
-  // 💡 Création d'un "Protocol Control Block" (socket léger LwIP)
-  pcb = udp_new();
-  if (!pcb)
-  {
-    return;
-  }
+    err_t err;
 
-  // 💡 Option SOF_BROADCAST indispensable pour envoyer à .255
-  pcb->so_options |= SOF_BROADCAST;
+    /* 1. Création du socket UDP */
+    pcb = udp_new();
+    if (!pcb)
+    {
+        return;   // Échec allocation PCB
+    }
 
-  // Broadcast global (ça marche bien avec ton PC en 169.254.x.x)
-  ipaddr_aton("192.168.129.255", &dest_ip);
+    /* 2. Activation du mode broadcast */
+    pcb->so_options |= SOF_BROADCAST;
 
-  // Bind sur n'importe quelle IP / n'importe quel port
-  udp_bind(pcb, IP_ADDR_ANY, 0);
+    /* 3. Adresse de broadcast (adaptée à ton réseau actuel) */
+    ipaddr_aton("192.168.129.255", &dest_ip);
 
-  // Construction du JSON
-  // Construction du JSON
+    /* Bind : on n’impose ni port source ni IP */
+    udp_bind(pcb, IP_ADDR_ANY, 0);
+
+    /* ---------------------------------------------------------------------- */
+    /*                  Construction du message JSON "presence"               */
+    /* ---------------------------------------------------------------------- */
+
     char json[256];
 
-    // 💡 CORRECTION : Récupération dynamique de l'IP réelle via LwIP
+    // Récupération dynamique de l'adresse IP actuelle via LwIP
     extern struct netif gnetif;
     char *device_ip = ipaddr_ntoa(&gnetif.ip_addr);
 
-    // 💡 snprintf formate le message JSON avec l'IP dynamique
     snprintf(json, sizeof(json),
-        "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", \"timestamp\": \"2025-10-02T08:20:00Z\" }",
+        "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", "
+        "\"timestamp\": \"2025-10-02T08:20:00Z\" }",
         device_ip);
 
-  // 💡 Allocation d'un buffer LwIP (pbuf) en RAM
-  p = pbuf_alloc(PBUF_TRANSPORT, strlen(json), PBUF_RAM);
-  if (!p)
-  {
-    udp_remove(pcb);
-    return;
-  }
+    /* ---------------------------------------------------------------------- */
+    /*               Allocation d’un pbuf contenant le JSON                   */
+    /* ---------------------------------------------------------------------- */
 
-  // 💡 Copie des données dans le buffer
-  memcpy(p->payload, json, strlen(json));
-  // 💡 Envoi effectif du paquet UDP
-  err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
+    p = pbuf_alloc(PBUF_TRANSPORT, strlen(json), PBUF_RAM);
+    if (!p)
+    {
+        udp_remove(pcb);   // Éviter fuite mémoire
+        return;
+    }
 
-  // 💡 TRES IMPORTANT : Libération mémoire pour éviter les fuites (Memory Leak)
-  pbuf_free(p);
-  udp_remove(pcb);
+    /* Copie du JSON dans le buffer transport (payload LwIP) */
+    memcpy(p->payload, json, strlen(json));
 
-  //  éventuellement afficher err via UART si tu veux debug
+    /* 4. Envoi du message UDP en broadcast */
+    err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
+    (void)err;// empêche le warning "unused variable"
+
+    /* ---------------------------------------------------------------------- */
+    /*                          Libérations mémoire                           */
+    /* ---------------------------------------------------------------------- */
+
+    pbuf_free(p);    // Libération buffer
+    udp_remove(pcb); // Fermeture du socket UDP
+
+    // Pour debug :
+    // if (err != ERR_OK) print erreur
 }
 
-// 💡 Callback appelée automatiquement par le hardware quand le DMA a fini de remplir le buffer ADC
-void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+/**
+  * @brief Callback déclenchée lorsque le DMA termine un transfert ADC.
+  *
+  * Cette fonction est appelée par le HAL lorsque :
+  *   - l’ADC1 a terminé la conversion des 3 canaux,
+  *   - et que le DMA a copié les valeurs dans adc_raw[].
+  *
+  * Rôle :
+  *   ✔ Débloquer la tâche sismique (StartSeismicTask) via un sémaphore
+  *   ✔ Indiquer visuellement l’acquisition (clignotement LED2)
+  *
+  * Note :
+  *   Aucun calcul ne doit être fait ici → fonction courte et réactive.
+  */
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	if (hadc->Instance == ADC1)
-	  {
-	    // On libère le sémaphore pour réveiller la tâche sismique
-	    osSemaphoreRelease(adcReadySemHandle);
-	    // Toggle LED pour debug visuel (optionnel)
-	    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	  }
+    /* Vérifie que l'interruption provient bien de l'ADC1 */
+    if (hadc->Instance == ADC1)
+    {
+        /* Débloque la tâche sismique pour traiter une nouvelle mesure */
+        osSemaphoreRelease(adcReadySemHandle);
+
+        /* Clignotement LED2 = indicateur visuel des acquisitions ADC */
+        HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+    }
 }
 
 /**
   * @brief Tâche de traitement du signal sismique
   * @note  Lit les valeurs brutes, filtre (moyenne) et calcule l'énergie (RMS)
+  * Fonctionnement :
+  *   1️ Attente d’une nouvelle mesure ADC via sémaphore (DMA → Callback)
+  *   2️ Mise à jour des buffers (fenêtre glissante de 100 échantillons)
+  *   3️ Calcul de la moyenne puis du RMS pour X/Y/Z
+  *   4️ Détection locale si RMS dépasse un SEUIL
+  *   5️ Enregistrement horodaté dans la FRAM toutes les 2 secondes
+  *   6️ Flash mémoire RAM : stockage des 10 derniers pics locaux
+  *   7️ Log UART horodaté
+  *   8️ Alerte collective si NOEUD + VOISIN détectent un tremblement
   */
-void StartSeismicTask(void const * argument) //lle inclut une "mémoire" de 3 secondes.
+void StartSeismicTask(void const * argument)
 {
-    memset(buf_x,0,sizeof(buf_x)); memset(buf_y,0,sizeof(buf_y)); memset(buf_z,0,sizeof(buf_z));
-    int buffer_idx = 0;
+    /* Initialisation : vider les buffers circulaires RMS */
+    memset(buf_x, 0, sizeof(buf_x));
+    memset(buf_y, 0, sizeof(buf_y));
+    memset(buf_z, 0, sizeof(buf_z));
 
-    // Variables de temps
-    uint32_t last_tremor_time = 0; // Moment du dernier RMS > 300
-    uint32_t last_print_time = 0;  // Pour éviter le spam UART
-    uint32_t last_save_time = 0;   // Pour l'écriture FRAM
+    int buffer_idx = 0;          // Index dans la fenêtre glissante
+    uint32_t last_tremor_time = 0;
+    uint32_t last_print_time = 0;
+    uint32_t last_save_time  = 0;
 
     char msg[100];
 
-    for(;;) {
+    /* Boucle principale temps réel */
+    for (;;)
+    {
+        /* -------------------------------------------------------------- */
+        /*       1️⃣ Attente nouvelle conversion ADC (DMA + Sémaphore)      */
+        /* -------------------------------------------------------------- */
         osSemaphoreWait(adcReadySemHandle, osWaitForever);
 
-        // --- 1. Calcul RMS (inchangé) ---
-        float raw_x = adc_raw[0], raw_y = adc_raw[1], raw_z = adc_raw[2];
-        buf_x[buffer_idx]=raw_x; buf_y[buffer_idx]=raw_y; buf_z[buffer_idx]=raw_z;
+        /* -------------------------------------------------------------- */
+        /*               2️⃣ Acquisition des valeurs brutes ADC            */
+        /* -------------------------------------------------------------- */
+        float raw_x = adc_raw[0];
+        float raw_y = adc_raw[1];
+        float raw_z = adc_raw[2];
 
-        float mean_x=0, mean_y=0, mean_z=0;
-        for(int i=0; i<WINDOW_SIZE; i++) { mean_x+=buf_x[i]; mean_y+=buf_y[i]; mean_z+=buf_z[i]; }
-        mean_x/=WINDOW_SIZE; mean_y/=WINDOW_SIZE; mean_z/=WINDOW_SIZE;
+        /* Mise à jour buffers circulaires */
+        buf_x[buffer_idx] = raw_x;
+        buf_y[buffer_idx] = raw_y;
+        buf_z[buffer_idx] = raw_z;
 
-        float var_x=0, var_y=0, var_z=0;
-        for(int i=0; i<WINDOW_SIZE; i++) {
-             var_x+=powf(buf_x[i]-mean_x,2); var_y+=powf(buf_y[i]-mean_y,2); var_z+=powf(buf_z[i]-mean_z,2);
+        /* -------------------------------------------------------------- */
+        /*                   3️⃣ Calcul Moyenne + RMS                       */
+        /* -------------------------------------------------------------- */
+
+        float mean_x = 0, mean_y = 0, mean_z = 0;
+
+        for (int i = 0; i < WINDOW_SIZE; i++)
+        {
+            mean_x += buf_x[i];
+            mean_y += buf_y[i];
+            mean_z += buf_z[i];
         }
-        float calc_rms_x = sqrtf(var_x/WINDOW_SIZE);
-        float calc_rms_y = sqrtf(var_y/WINDOW_SIZE);
-        float calc_rms_z = sqrtf(var_z/WINDOW_SIZE);
 
-        // Mise à jour variables globales protégées
+        mean_x /= WINDOW_SIZE;
+        mean_y /= WINDOW_SIZE;
+        mean_z /= WINDOW_SIZE;
+
+        float var_x = 0, var_y = 0, var_z = 0;
+
+        for (int i = 0; i < WINDOW_SIZE; i++)
+        {
+            var_x += powf(buf_x[i] - mean_x, 2);
+            var_y += powf(buf_y[i] - mean_y, 2);
+            var_z += powf(buf_z[i] - mean_z, 2);
+        }
+
+        float calc_rms_x = sqrtf(var_x / WINDOW_SIZE);
+        float calc_rms_y = sqrtf(var_y / WINDOW_SIZE);
+        float calc_rms_z = sqrtf(var_z / WINDOW_SIZE);
+
+        /* Mise à jour des valeurs globales protégée par mutex */
         osMutexWait(dataMutexHandle, osWaitForever);
-        rms_x = calc_rms_x; rms_y = calc_rms_y; rms_z = calc_rms_z;
+        rms_x = calc_rms_x;
+        rms_y = calc_rms_y;
+        rms_z = calc_rms_z;
         osMutexRelease(dataMutexHandle);
 
+        /* -------------------------------------------------------------- */
+        /*                     4️⃣ Détection locale                         */
+        /* -------------------------------------------------------------- */
+        if (calc_rms_x > SEISMIC_THRESHOLD ||
+            calc_rms_y > SEISMIC_THRESHOLD ||
+            calc_rms_z > SEISMIC_THRESHOLD)
+        {
+            my_alert_status = 1;  // Le nœud local détecte une secousse
+            last_tremor_time = HAL_GetTick();
 
-        // --- 2. Logique de Détection Améliorée ---
+            /* --- Log UART toutes les 500 ms --- */
+            if (HAL_GetTick() - last_print_time > 500)
+            {
+                float max_val = calc_rms_x;
+                if (calc_rms_y > max_val) max_val = calc_rms_y;
+                if (calc_rms_z > max_val) max_val = calc_rms_z;
 
-        // Est-ce qu'on tremble MAINTENANT ?
-        if (calc_rms_x > SEISMIC_THRESHOLD || calc_rms_y > SEISMIC_THRESHOLD || calc_rms_z > SEISMIC_THRESHOLD) {
-
-            my_alert_status = 1; // 🚨 ON PASSE EN ALERTE
-            last_tremor_time = HAL_GetTick(); // On remet le chrono à zéro
-
-            // Anti-Spam UART : On affiche seulement toutes les 500ms
-            if (HAL_GetTick() - last_print_time > 500) {
-                float max_val = (calc_rms_x > calc_rms_y) ? calc_rms_x : calc_rms_y;
-                sprintf(msg, "⚠️ TREMBLEMENT LOCAL (RMS: %.0f)\r\n", max_val);
-                //affichage heure durant lla secousse
                 uint8_t h, m, s;
-
                 RTC_GetTime(&h, &m, &s);
-                sprintf(msg, "[%02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL (RMS: %.0f)\r\n", h, m, s, max_val);
+
+                sprintf(msg,
+                    "[%02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL — RMS max: %.2f\r\n",
+                    h, m, s, max_val);
+
                 HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
                 last_print_time = HAL_GetTick();
             }
 
-            // Sauvegarde FRAM (toutes les 2s max)
-            if (HAL_GetTick() - last_save_time > 2000) {
+            /* ---------------------------------------------------------- */
+            /*         5️⃣ Stockage FRAM (Boîte noire) toutes les 2 s      */
+            /* ---------------------------------------------------------- */
+            if (HAL_GetTick() - last_save_time > 2000)
+            {
                 float max_val = calc_rms_x;
-                if(calc_rms_y > max_val) max_val = calc_rms_y;
-                if(calc_rms_z > max_val) max_val = calc_rms_z;
+                if (calc_rms_y > max_val) max_val = calc_rms_y;
+                if (calc_rms_z > max_val) max_val = calc_rms_z;
 
-                uint8_t h, m, s; RTC_GetTime(&h, &m, &s);
-                SeismicEvent evt; evt.hour=h; evt.min=m; evt.sec=s; evt.intensity=max_val;
-                FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(SeismicEvent));
-                HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET); // LED Rouge Fixe
+                /* 6️⃣ Stockage en RAM des 10 derniers maxima locaux */
+                local_peaks[local_idx] = max_val;
+                local_idx = (local_idx + 1) % 10;
+
+                /* Horodatage RTC */
+                uint8_t h, m, s;
+                RTC_GetTime(&h, &m, &s);
+
+                SeismicEvent evt = {h, m, s, 0, max_val};
+                FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(evt));
+
+                HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
                 last_save_time = HAL_GetTick();
             }
         }
-        else {
-            // C'est calme maintenant.
-            // MAIS on garde l'alerte active pendant 3 secondes après la dernière secousse !
-            if (HAL_GetTick() - last_tremor_time > 3000) {
-                if (my_alert_status == 1) {
-                     // Fin de l'alerte
-                     my_alert_status = 0;
-                     HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-                     HAL_UART_Transmit(&huart3, (uint8_t*)"✅ Fin de l'alerte locale.\r\n", 30, 100);
+        else
+        {
+            /* Extinction de l'alerte après 3 secondes sans tremblement */
+            if (HAL_GetTick() - last_tremor_time > 3000)
+            {
+                if (my_alert_status == 1)
+                {
+                    my_alert_status = 0;
+                    HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+
+                    HAL_UART_Transmit(&huart3,
+                        (uint8_t*)"✅ Fin de l'alerte locale.\r\n", 30, 100);
                 }
             }
         }
 
-        // --- 3. Consensus (Alerte Collective) ---
-        // Si JE tremble (ou j'ai tremblé il y a <3s) ET le VOISIN tremble
-        if (my_alert_status == 1 && neighbor_alert_status == 1) {
-             HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // Clignotement panique
+        /* -------------------------------------------------------------- */
+        /*                    7️⃣ Détection Collective                     */
+        /* -------------------------------------------------------------- */
+        if (my_alert_status == 1 && neighbor_alert_status == 1)
+        {
+            /* ALERTES CONFIRMÉES PAR VOISIN → CLIGNOTEMENT */
+            HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
         }
 
+        /* Mise à jour de l’index circulaire */
         buffer_idx = (buffer_idx + 1) % WINDOW_SIZE;
     }
 }
@@ -961,182 +1173,453 @@ static struct tcp_pcb *server_pcb;
 /**
   * @brief Initialisation du serveur TCP
   * @note  Ouvre le port 12345 en écoute
+  *   1️ Création d’un PCB TCP (socket LwIP)
+  *   2️ bind → association du port TCP 12345 au PCB
+  *   3️ listen → passage du serveur en mode écoute
+  *   4️ accept callback → fonction déclenchée lorsqu’un client se connecte
   */
 void tcp_server_init(void)
 {
+    /* 1️⃣ Création d’un nouveau PCB TCP */
     server_pcb = tcp_new();
-    if (server_pcb == NULL) return;
+    if (server_pcb == NULL)
+    {
+        // Impossible de créer le PCB TCP
+        return;
+    }
 
-    // 💡 Bind : on attache le PCB au port 12345
+    /* 2️⃣ Bind : attacher le PCB au port TCP 12345 */
     tcp_bind(server_pcb, IP_ADDR_ANY, 12345);
-    // 💡 Listen : on passe en mode écoute
+
+    /* 3️⃣ Passage en mode écoute — le PCB devient un serveur */
     server_pcb = tcp_listen(server_pcb);
 
-    // 💡 Accept : on définit quelle fonction appeler quand un client se connecte
+    /* 4️⃣ Définir la fonction callback appelée lors d’une nouvelle connexion */
     tcp_accept(server_pcb, tcp_server_accept);
 }
 
-// 💡 Callback appelée quand un nouveau client se connecte au serveur
+/* 💡 Callback appelée quand un nouveau client se connecte au serveur
+ * * Paramètres :
+  *   - newpcb : PCB dédié à la nouvelle connexion client
+  *   - err    : état de la connexion (généralement ERR_OK)
+  *
+  * Rôle :
+  *   ✔ Log UART → affiche l'adresse IP du client
+  *   ✔ Associe au client une routine de réception (tcp_server_recv)
+  *
+  * Remarque :
+  *   Une connexion → un PCB dédié. Le serveur reste disponible pour d'autres clients.
+  */
 err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
+    /* En cas d’erreur de connexion, on refuse immédiatement */
+    if (err != ERR_OK || newpcb == NULL)
+    {
+        return ERR_VAL;
+    }
+
+    /* ------------------------- LOG DE CONNEXION -------------------------- */
     char msg[80];
-    sprintf(msg, "📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
+    sprintf(msg,
+            "📥 Client connecté depuis %s\r\n",
+            ipaddr_ntoa(&newpcb->remote_ip));
+
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    // 💡 On définit la fonction de réception pour cette nouvelle connexion
+    /* ----------------------------------------------------------------------
+     * Associer une fonction de réception TCP dédiée à cette connexion.
+     * → À chaque fois que le client envoie un paquet,
+     *   tcp_server_recv() sera appelée.
+     * ---------------------------------------------------------------------- */
     tcp_recv(newpcb, tcp_server_recv);
 
     return ERR_OK;
-
-
-
 }
+/*
+ * Fonction appelée automatiquement lorsqu’un client envoie
+  *        des données au serveur TCP.
+  *
+  * Rôle :
+  *   ✔ Lire les données reçues
+  *   ✔ Vérifier s'il s’agit d’une requête "data_request"
+  *   ✔ Envoyer un JSON contenant : RMS, timestamp, et statut d’alerte
+  *   ✔ Fermer proprement la connexion après réponse
+  *
+  * Important :
+  *   p->payload contient uniquement la charge utile du paquet TCP
+ *
+ * */
+err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    /* --------------------------- Validation entrée ------------------------- */
+    if (err != ERR_OK || p == NULL)
+    {
+        /* Si p existe encore, on doit libérer la mémoire */
+        if (p) pbuf_free(p);
 
-// 💡 Callback appelée quand des données arrivent sur le serveur
-err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    if (err!=ERR_OK || p==NULL) { if(p) pbuf_free(p); tcp_close(tpcb); return ERR_OK; }
+        /* Fermeture propre de la connexion */
+        tcp_close(tpcb);
 
+        return ERR_OK;
+    }
+
+    /* ------------------------- Lecture du message reçu --------------------- */
     char buffer[256];
-    uint16_t len = (p->len < sizeof(buffer)-1)?p->len:sizeof(buffer)-1;
-    memcpy(buffer, p->payload, len); buffer[len]=0;
+    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
+
+    memcpy(buffer, p->payload, len);
+    buffer[len] = '\0';   // Sécurisation : fin de chaîne
+
+    /* Indique à LwIP que nous avons traité ces octets */
     tcp_recved(tpcb, p->tot_len);
 
-    if (strstr(buffer, "\"data_request\"")) {
+
+    /* ----------------------------------------------------------------------
+     *  Traitement : Le client demande une mesure ?
+     * ---------------------------------------------------------------------- */
+    if (strstr(buffer, "\"data_request\"") != NULL)
+    {
         float tx_x, tx_y, tx_z;
+
+        /* Lecture thread-safe des données RMS */
         osMutexWait(dataMutexHandle, osWaitForever);
-        tx_x = rms_x; tx_y = rms_y; tx_z = rms_z;
+        tx_x = rms_x;
+        tx_y = rms_y;
+        tx_z = rms_z;
         osMutexRelease(dataMutexHandle);
 
+        /* --------------------------------------------------------------
+         * Construction de la réponse JSON
+         * -------------------------------------------------------------- */
         char response[300];
-        // Format JSON conforme PDF avec statut dynamique
-        snprintf(response, sizeof(response),
-                "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-                "\"timestamp\": \"2025-10-02T...\", "
-                "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-                "\"status\": \"%s\" }",
-                tx_x, tx_y, tx_z, my_alert_status ? "alert" : "normal");
+        uint8_t h, m, s;
+        RTC_GetTime(&h, &m, &s);
 
+        snprintf(response, sizeof(response),
+             "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+             "\"timestamp\": \"%02d:%02d:%02d\", "
+             "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+             "\"status\": \"%s\" }",
+             h, m, s,
+             tx_x, tx_y, tx_z,
+             my_alert_status ? "alert" : "normal"
+        );
+
+        /* Envoi de la réponse TCP */
         tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
         tcp_output(tpcb);
+
+        /* Connexion fermée après réponse */
         tcp_close(tpcb);
     }
+
+    /* Nettoyage indispensable du buffer LwIP */
     pbuf_free(p);
+
     return ERR_OK;
 }
 
 /**
   * @brief Fonction Client TCP : Initie une connexion vers une IP
+  *
+  * Initialise une connexion TCP vers une carte voisine afin
+  *         d'envoyer une requête JSON de type "data_request".
+  *
+  * Rôle :
+  *   ✔ Créer un PCB client TCP
+  *   ✔ Démarrer une connexion vers l'IP cible
+  *   ✔ Si connexion réussie → callback tcp_client_connected()
+  *   ✔ Si erreur → message UART + abort du PCB
+  *
+  * @param ip  Adresse IP du voisin (ex : "192.168.1.101")
   */
 void send_data_request_tcp(const char *ip)
 {
+    /* ----------------------------------------------------------------------
+     * 1) Création du PCB TCP (socket client)
+     * ---------------------------------------------------------------------- */
     struct tcp_pcb *pcb = tcp_new();
-    if (!pcb) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ tcp_new FAILED\r\n", 20, HAL_MAX_DELAY);
+    if (!pcb)
+    {
+        HAL_UART_Transmit(&huart3,
+                          (uint8_t*)"❌ tcp_new FAILED\r\n",
+                          20,
+                          HAL_MAX_DELAY);
         return;
     }
 
+    /* ----------------------------------------------------------------------
+     * 2) Conversion de l’adresse IP ASCII → format LwIP
+     * ---------------------------------------------------------------------- */
     ip_addr_t dest_ip;
     ipaddr_aton(ip, &dest_ip);
 
+    /* Message UART d’information */
     char msg[80];
     snprintf(msg, sizeof(msg), "🔵 Connexion vers %s...\r\n", ip);
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
-    // 💡 Tentative de connexion sur le port 12345
-    // Si succès -> tcp_client_connected sera appelée
+
+    /* ----------------------------------------------------------------------
+     * 3) Tentative de connexion TCP
+     *    - Port cible : 12345
+     *    - Callback après connexion : tcp_client_connected()
+     * ---------------------------------------------------------------------- */
     err_t err = tcp_connect(pcb, &dest_ip, 12345, tcp_client_connected);
 
-    if (err != ERR_OK) {
+    /* ----------------------------------------------------------------------
+     * 4) Gestion d’erreur connexion
+     * ---------------------------------------------------------------------- */
+    if (err != ERR_OK)
+    {
         snprintf(msg, sizeof(msg),
                  "❌ tcp_connect ERROR = %d\r\n", err);
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-        tcp_abort(pcb); // Annule le PCB en cas d'erreur
+
+        /* tcp_abort() détruit le PCB proprement (pas de fuite mémoire) */
+        tcp_abort(pcb);
     }
 }
 
 
 // 💡 Callback appelée quand la connexion client est réussie
+/*ppelée automatiquement par LwIP lorsque le client TCP arrive à
+  *         se connecter au serveur voisin.
+  *
+  * Rôle :
+  *   ✔ Vérifier que la connexion est valide
+  *   ✔ Installer la fonction de réception (tcp_client_recv_response)
+  *   ✔ Construire et envoyer la requête JSON "data_request"
+  **/
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
-    if (err != ERR_OK) {
-        tcp_close(tpcb);
+    /* ----------------------------- Vérification ---------------------------- */
+    if (err != ERR_OK)
+    {
+        tcp_close(tpcb);  // Connexion ratée → fermeture du PCB
         return err;
     }
 
-    // 💡 Etape 2 : On définit la fonction qui va écouter la RÉPONSE du serveur
+    /* ----------------------------------------------------------------------
+     * 1) Définir la fonction qui traitera la réponse du serveur
+     * ---------------------------------------------------------------------- */
     tcp_recv(tpcb, tcp_client_recv_response);
 
-    // 💡 Construction de la REQUÊTE JSON (Conforme PDF [cite: 110-116])
+    /* ----------------------------------------------------------------------
+     * 2) Construction de la requête JSON conforme aux spécifications
+     *    { "type": "data_request", "from": "...", "to": "...", "timestamp": ... }
+     * ---------------------------------------------------------------------- */
     char sendbuf[256];
     int len = snprintf(sendbuf, sizeof(sendbuf),
-        "{ \"type\": \"data_request\", \"from\": \"nucleo-8\", \"to\": \"broadcast\", \"timestamp\": \"2025-10-02T08:00:00Z\" }");
+         "{ \"type\": \"data_request\", \"from\": \"nucleo-8\", \"to\": \"%s\", "
+         "\"timestamp\": \"2025-10-02T08:21:00Z\" }",
+         ipaddr_ntoa(&tpcb->remote_ip)
+    );
 
-    // Envoi
+    /* ----------------------------------------------------------------------
+     * 3) Envoi de la requête JSON vers le voisin
+     * ---------------------------------------------------------------------- */
     tcp_write(tpcb, sendbuf, len, TCP_WRITE_FLAG_COPY);
     tcp_output(tpcb);
 
-    // ⚠️ IMPORTANT : On ne ferme PAS la connexion (tcp_close) ici !
-    // On attend que le serveur réponde. C'est tcp_client_recv_response qui fermera.
+    /* ⚠️ IMPORTANT : on NE ferme PAS la connexion ici !
+       La fonction tcp_client_recv_response() s'en occupera. */
 
     return ERR_OK;
 }
 
-err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err) {
-    if (err!=ERR_OK || p==NULL) { if(p) pbuf_free(p); tcp_close(tpcb); return ERR_OK; }
+/*
+ * Traite le JSON envoyé par le serveur.
+  *
+  * Rôle :
+  *   ✔ Lire et copier proprement les données reçues
+  *   ✔ Extraire l’état ("status") : normal / alert
+  *   ✔ Extraire les valeurs RMS x, y, z du voisin
+  *   ✔ Mettre à jour l’intelligence collective (10 derniers pics)
+  *   ✔ Déclencher l’alerte collective si nécessaire
+  *   ✔ Fermer proprement la connexion TCP
+ * */
+err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
+{
+    /* --------------------------- Validation entrée ------------------------- */
+    if (err != ERR_OK || p == NULL)
+    {
+        if (p) pbuf_free(p);
+        tcp_close(tpcb);
+        return ERR_OK;
+    }
 
+    /* ----------------------- Copie locale du message ----------------------- */
     char buffer[512];
-    uint16_t len = (p->len < sizeof(buffer)-1)?p->len:sizeof(buffer)-1;
-    memcpy(buffer, p->payload, len); buffer[len]=0;
+    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
+
+    memcpy(buffer, p->payload, len);
+    buffer[len] = '\0';
+
+    /* Indiquer à LwIP que les données ont été traitées */
     tcp_recved(tpcb, p->tot_len);
 
-    // Analyse Voisin
-    if (strstr(buffer, "\"status\": \"alert\"")) {
+    /* ---------------------- Parsing du statut d’alerte --------------------- */
+    int is_alert = (strstr(buffer, "\"status\": \"alert\"") != NULL);
+
+    /* ---------------------- Extraction des valeurs RMS --------------------- */
+    float rx_x = 0, rx_y = 0, rx_z = 0;
+
+    char *ptr = strstr(buffer, "\"acceleration\"");
+    if (ptr)
+    {
+        char *ptr_x = strstr(ptr, "\"x\":");
+        char *ptr_y = strstr(ptr, "\"y\":");
+        char *ptr_z = strstr(ptr, "\"z\":");
+
+        if (ptr_x) sscanf(ptr_x + 4, "%f", &rx_x);
+        if (ptr_y) sscanf(ptr_y + 4, "%f", &rx_y);
+        if (ptr_z) sscanf(ptr_z + 4, "%f", &rx_z);
+    }
+
+    /* Déterminer le RMS maximum chez le voisin */
+    float neighbor_max_rms = rx_x;
+    if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
+    if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
+
+    /* ----------------------- Stockage RAM (exigence prof) ------------------ */
+    neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+    neighbor_idx = (neighbor_idx + 1) % 10;
+
+    /* ------------------------- Gestion du statut voisin --------------------- */
+    if (is_alert)
+    {
         neighbor_alert_status = 1;
-        HAL_UART_Transmit(&huart3, (uint8_t*)"⚠️ VOISIN EN ALERTE !\r\n", 24, 100);
-        neighbor_peaks[neighbor_idx] = 999.0f;
-        neighbor_idx = (neighbor_idx + 1) % 10;
-    } else {
+
+        char msg[60];
+        sprintf(msg, "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n", neighbor_max_rms);
+        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+    }
+    else
+    {
         neighbor_alert_status = 0;
-        // --- CORRECTION : AJOUT LOG CONNECTION REUSSIE ---
-        // Affiche un petit message pour confirmer qu'on a bien reçu la réponse du voisin
-        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ Voisin calme (Ping OK)\r\n", 28, 100);
     }
 
-    if (my_alert_status && neighbor_alert_status) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n", 54, 100);
+    /* ------------------------- ALERTE COLLECTIVE --------------------------- */
+    if (my_alert_status && neighbor_alert_status)
+    {
+        HAL_UART_Transmit(&huart3,
+            (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n",
+            54,
+            100
+        );
     }
 
-    pbuf_free(p); tcp_close(tpcb);
+    /* --------------------------- Nettoyage + fermeture ---------------------- */
+    pbuf_free(p);
+    tcp_close(tpcb);
+
     return ERR_OK;
 }
 
-
+/*
+ * OUTILS DE CONVERSION BCD <-> DECIMAL (utilisés par le RTC)         */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief Convertit un entier décimal en format BCD.
+  *
+  * Exemple :
+  *   45 décimal → 0x45 en BCD
+  *
+  * @param val  Valeur décimale (0–99)
+  * @return     Valeur codée en BCD (Binary Coded Decimal)
+ * */
 // --- OUTILS CONVERSION (Le RTC parle en BCD, nous en Décimal) ---
 // Exemple : 45 secondes -> 0x45 (BCD)
-uint8_t decToBcd(int val) { return (uint8_t)((val/10*16) + (val%10)); }
-int bcdToDec(uint8_t val) { return (int)((val/16*10) + (val%16)); }
+uint8_t decToBcd(int val)
+{
+    return (uint8_t)((val / 10 * 16) + (val % 10));
+}
 
-// --- DRIVER RTC (BQ32000 via I2C1) ---
+/**
+  * @brief Convertit un octet BCD en entier décimal.
+  *
+  * Exemple :
+  *   0x45 → 45
+  *
+  * @param val  Valeur en BCD
+  * @return     Valeur décimale
+  */
+int bcdToDec(uint8_t val)
+{
+    return (int)((val / 16 * 10) + (val % 16));
+}
+
+/*Programme l'heure dans le RTC.
+  *
+  * Rôle :
+  *   ✔ Convertir les valeurs décimales en BCD
+  *   ✔ Écrire 3 registres consécutifs :
+  *         0x00 → secondes
+  *         0x01 → minutes
+  *         0x02 → heures
+  *
+  * @param hour  Heures   (0–23)
+  * @param min   Minutes  (0–59)
+  * @param sec   Secondes (0–59)
+ * */
 
 
 void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec)
 {
     uint8_t data[3];
-    data[0] = decToBcd(sec); // Registre 0x00 : Secondes
-    data[1] = decToBcd(min); // Registre 0x01 : Minutes
-    data[2] = decToBcd(hour); // Registre 0x02 : Heures
 
-    // On écrit à partir de l'adresse mémoire 0x00 du RTC
-    HAL_I2C_Mem_Write(&hi2c1, RTC_ADDR, 0x00, 1, data, 3, 1000);
+    data[0] = decToBcd(sec);   // Registre 0x00 : Secondes
+    data[1] = decToBcd(min);   // Registre 0x01 : Minutes
+    data[2] = decToBcd(hour);  // Registre 0x02 : Heures
+
+    /*
+     * On écrit dans le RTC (adresse 0xD0) à partir du registre 0x00.
+     * HAL_I2C_Mem_Write() gère :
+     *   - START condition
+     *   - Adresse écriture
+     *   - Registre interne
+     *   - Envoi des données
+     *   - STOP condition
+     */
+    HAL_I2C_Mem_Write(&hi2c1,
+                      RTC_ADDR,
+                      0x00,          // Adresse du premier registre (sec)
+                      1,             // Taille adresse registre (1 octet)
+                      data,
+                      3,             // 3 octets : sec / min / hour
+                      1000);
 }
+/**
+  * @brief Lit l'heure courante depuis le RTC.
+  *
+  * Rôle :
+  *   ✔ Lire 3 registres : secondes, minutes, heures
+  *   ✔ Convertir du format BCD vers décimal
+  *
+  * Note importante :
+  *   data[0] contient un bit spécial (CH = Clock Halt).
+  *   → On masque avec 0x7F pour ne garder que les 7 bits utiles.
+  *
+  * @param hour  Pointeur où stocker l'heure
+  * @param min   Pointeur où stocker les minutes
+  * @param sec   Pointeur où stocker les secondes
+  */
 
 void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec)
 {
     uint8_t data[3];
-    // On lit 3 octets à partir de l'adresse 0x00
-    HAL_I2C_Mem_Read(&hi2c1, RTC_ADDR, 0x00, 1, data, 3, 1000);
 
-    *sec  = bcdToDec(data[0] & 0x7F); // Masque pour ignorer le bit d'arrêt
+    /* Lecture séquentielle des registres 0x00, 0x01, 0x02 */
+    HAL_I2C_Mem_Read(&hi2c1,
+                     RTC_ADDR,
+                     0x00,
+                     1,
+                     data,
+                     3,
+                     1000);
+
+    *sec  = bcdToDec(data[0] & 0x7F);  // Retirer le bit CH (Clock Halt)
     *min  = bcdToDec(data[1]);
     *hour = bcdToDec(data[2]);
 }
@@ -1145,83 +1628,200 @@ void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec)
 
 
 // Fonction interne pour activer l'écriture (WREN)
+/* -------------------------------------------------------------------------- */
+/*                  FRAM SPI — Commandes et opérations bas niveau             */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief  Active le mode écriture dans la FRAM (Write Enable - WREN)
+  *
+  * Rôle :
+  *   ✔ La FRAM refuse toute écriture tant que la commande WREN n'est pas envoyée
+  *   ✔ Cette commande doit précéder **chaque écriture**
+  *
+  * Séquence SPI :
+  *   CS ↓
+  *   Envoi : 0x06 (FRAM_WREN)
+  *   CS ↑
+  */
 void FRAM_WriteEnable(void)
 {
     uint8_t cmd = FRAM_WREN;
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low (Active)
-    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High (Inactive)
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);   // CS LOW = Active
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);                  // Envoi commande WREN
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);     // CS HIGH = Inactive
 }
 
+/* -------------------------------------------------------------------------- */
+/*                      ÉCRITURE dans la FRAM (Write Operation)               */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief  Écrit un bloc de données dans la FRAM à une adresse 24 bits.
+  *
+  * Séquence d’écriture SPI :
+  *   1) WREN (obligatoire)
+  *   2) CS ↓
+  *   3) Envoi opcode WRITE (0x02)
+  *   4) Envoi adresse 24 bits : A23 A22 ... A0
+  *   5) Envoi des données
+  *   6) CS ↑
+  *
+  * @param addr  Adresse 24 bits (0x000000–0x0FFFFF suivant modèle)
+  * @param pData Pointeur vers les données à écrire
+  * @param size  Nombre d’octets à écrire
+  */
 void FRAM_Write(uint32_t addr, uint8_t *pData, uint16_t size)
 {
-    FRAM_WriteEnable(); // Indispensable avant chaque écriture !
+    /* 1) Autoriser l’écriture */
+    FRAM_WriteEnable();
 
+    /* 2) Préparation du buffer commande + adresse */
     uint8_t cmd[4];
-    cmd[0] = FRAM_WRITE;
-    // La FRAM a des adresses sur 3 octets (24 bits)
-    cmd[1] = (addr >> 16) & 0xFF;
-    cmd[2] = (addr >> 8) & 0xFF;
-    cmd[3] = addr & 0xFF;
+    cmd[0] = FRAM_WRITE;              // Opcode 0x02
+    cmd[1] = (addr >> 16) & 0xFF;     // Adresse MSB
+    cmd[2] = (addr >> 8)  & 0xFF;
+    cmd[3] = addr & 0xFF;             // Adresse LSB
 
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low
-    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);       // Envoi Commande + Adresse
-    HAL_SPI_Transmit(&hspi2, pData, size, 100);  // Envoi Données
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High
+    /* 3) Séquence SPI d’écriture */
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);         // CS LOW
+
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);                         // Commande + adresse
+    HAL_SPI_Transmit(&hspi2, pData, size, 100);                    // Données
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);           // CS HIGH
 }
 
+/* -------------------------------------------------------------------------- */
+/*                        LECTURE dans la FRAM (Read Operation)               */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief  Lit un bloc d’octets depuis la FRAM.
+  *
+  * Séquence SPI :
+  *   CS ↓
+  *   Envoi opcode READ (0x03)
+  *   Envoi adresse 24 bits
+  *   Réception des données
+  *   CS ↑
+  *
+  * @param addr  Adresse 24 bits à lire
+  * @param pData Pointeur vers buffer de réception
+  * @param size  Nombre d’octets à lire
+  */
 void FRAM_Read(uint32_t addr, uint8_t *pData, uint16_t size)
 {
     uint8_t cmd[4];
-    cmd[0] = FRAM_READ;
+    cmd[0] = FRAM_READ;               // Opcode 0x03
     cmd[1] = (addr >> 16) & 0xFF;
-    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[2] = (addr >> 8)  & 0xFF;
     cmd[3] = addr & 0xFF;
 
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET); // CS Low
-    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);       // Envoi Commande + Adresse
-    HAL_SPI_Receive(&hspi2, pData, size, 100);   // Lecture Données
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);   // CS High
-}
+    /* Séquence SPI */
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);         // CS LOW
 
-//fonction qui appele quand le serveur répond
-void ntp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
+    HAL_SPI_Transmit(&hspi2, cmd, 4, 100);                         // Envoi commande + adresse
+    HAL_SPI_Receive(&hspi2, pData, size, 100);                     // Lecture données
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);           // CS HIGH
+}
+/* -------------------------------------------------------------------------- */
+/*        CALLBACK NTP — Appelée lorsqu’une réponse NTP est reçue (UDP)       */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief  Traite le paquet NTP reçu depuis le serveur de temps.
+  *
+  * Paquet NTP :
+  *   - Taille minimale : 48 octets
+  *   - Le timestamp "Transmit Timestamp" se trouve à l’offset 40
+  *     → format 32 bits "Seconds since 1900"
+  *
+  * Rôle :
+  *   ✔ Extraire la date/heure NTP (big endian)
+  *   ✔ Convertir vers epoch UNIX (1970)
+  *   ✔ Ajouter le fuseau horaire (Belgique = UTC+1)
+  *   ✔ Mettre à jour le RTC hardware
+  *   ✔ Marquer ntp_synced = 1 pour signaler la synchronisation réussie
+  *   ✔ Fermer proprement le PCB UDP
+  */
+void ntp_recv_callback(void *arg,
+                       struct udp_pcb *pcb,
+                       struct pbuf *p,
+                       const ip_addr_t *addr,
+                       u16_t port)
 {
-    if (p != NULL && p->tot_len >= 48) // Un paquet NTP fait 48 octets min
+    /* ----------------------------------------------------------------------
+     * 1) Vérification du paquet
+     * ---------------------------------------------------------------------- */
+    if (p != NULL && p->tot_len >= 48)   // Un paquet NTP valide fait ≥ 48 octets
     {
-        // Le timestamp se trouve à l'octet 40 du paquet NTP
+        /* Pointeur sur la charge utile du paquet UDP */
         uint8_t *payload = (uint8_t *)p->payload;
 
-        // Les données arrivent en Big Endian, il faut les reconstruire
-        uint32_t ntp_seconds = (payload[40] << 24) | (payload[41] << 16) | (payload[42] << 8) | payload[43];
+        /* ------------------------------------------------------------------
+         * 2) Extraction du timestamp NTP (32 bits)
+         *     Format : big endian (octets 40–43)
+         * ------------------------------------------------------------------ */
+        uint32_t ntp_seconds =
+            (payload[40] << 24) |
+            (payload[41] << 16) |
+            (payload[42] << 8)  |
+             payload[43];
 
-        // 1. Convertir NTP (1900) vers UNIX (1970)
-        // On soustrait 2 208 988 800 secondes
+        /* ------------------------------------------------------------------
+         * 3) Conversion NTP -> UNIX
+         *     - NTP epoch : 01/01/1900
+         *     - UNIX epoch : 01/01/1970
+         *     - Décalage : 2 208 988 800 s (NTP_TIMESTAMP_DELTA)
+         * ------------------------------------------------------------------ */
         uint32_t unix_time = ntp_seconds - NTP_TIMESTAMP_DELTA;
 
-        // 2. Appliquer le fuseau horaire (Belgique)
+        /* ------------------------------------------------------------------
+         * 4) Ajout du fuseau horaire (Belgique = UTC+1)
+         * ------------------------------------------------------------------ */
         unix_time += (TIMEZONE_OFFSET * 3600);
 
-        // 3. Calculer Heure/Minute/Seconde (Maths simples modulo)
+        /* ------------------------------------------------------------------
+         * 5) Conversion epoch → h/m/s
+         * ------------------------------------------------------------------ */
         uint8_t h = (unix_time / 3600) % 24;
-        uint8_t m = (unix_time / 60) % 60;
-        uint8_t s = unix_time % 60;
+        uint8_t m = (unix_time / 60)  % 60;
+        uint8_t s =  unix_time        % 60;
 
-        // 4. Mettre à jour le RTC hardware
+        /* ------------------------------------------------------------------
+         * 6) Mise à l’heure du RTC matériel
+         * ------------------------------------------------------------------ */
         RTC_SetTime(h, m, s);
-        ntp_synced = 1;
-        // 5. Feedback UART
+        ntp_synced = 1;   // Indique au système que l'heure est correcte
+
+        /* ------------------------------------------------------------------
+         * 7) Feedback UART pour debug
+         * ------------------------------------------------------------------ */
         char msg[64];
         sprintf(msg, "✅ HEURE SYNC NTP : %02d:%02d:%02d\r\n", h, m, s);
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
     }
 
-    // Nettoyage indispensable
-    pbuf_free(p);
-    udp_remove(pcb); // On ferme la connexion une fois l'heure reçue
+    /* ----------------------------------------------------------------------
+     * 8) Nettoyage indispensable
+     * ---------------------------------------------------------------------- */
+    pbuf_free(p);   // Libération du buffer LwIP
+    udp_remove(pcb); // Fermeture du socket UDP (one-shot request)
 }
 
-// Fonction pour demander l'heure au serveur NTP
+
+/* -------------------------------------------------------------------------- */
+/*                   ENVOI D’UNE REQUÊTE NTP (Client UDP)                    */
+/* -------------------------------------------------------------------------- */
+/**
+  * @brief  Envoie un paquet NTP à un serveur de temps pour obtenir l’heure.
+  *
+  * Fonctionnement :
+  *   ✔ Création d’un PCB UDP
+  *   ✔ Installation de la callback ntp_recv_callback()
+  *   ✔ Préparation du paquet NTP (48 octets, mode client)
+  *   ✔ Envoi vers serveur NTP (port 123)
+  *   ✔ Le PCB reste ouvert jusqu’à la réception → fermeture dans callback
+  */
 void Sync_Time_NTP(void)
 {
     struct udp_pcb *pcb;
@@ -1229,43 +1829,92 @@ void Sync_Time_NTP(void)
     ip_addr_t dest_ip;
     err_t err;
 
-    HAL_UART_Transmit(&huart3, (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n", 44, 100);
+    /* Message de debug via UART */
+    HAL_UART_Transmit(&huart3,
+                      (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n",
+                      44,
+                      100);
 
+    /* ----------------------------------------------------------------------
+     * 1) Création du PCB UDP
+     * ---------------------------------------------------------------------- */
     pcb = udp_new();
-    if (!pcb) return;
+    if (!pcb)
+        return;
 
-    // 💡 IMPORTANT : On dit à LwIP quelle fonction appeler quand une réponse arrive
+    /* ----------------------------------------------------------------------
+     * 2) Configuration de la callback de réception
+     *    → C’est ntp_recv_callback() qui traitera la réponse du serveur.
+     * ---------------------------------------------------------------------- */
     udp_recv(pcb, ntp_recv_callback, NULL);
 
-    // IP Belge (be.pool.ntp.org -> exemple 85.201.16.177 ou 193.191.177.6)
-    // Si tu veux changer, assure-toi que l'IP est valide. Celle de ton code est OK.
+    /* ----------------------------------------------------------------------
+     * 3) Préparation de l’adresse IP du serveur NTP
+     * ---------------------------------------------------------------------- */
     ipaddr_aton(NTP_SERVER_IP, &dest_ip);
 
-    // Création du paquet NTP
+    /* ----------------------------------------------------------------------
+     * 4) Création du paquet NTP (48 octets, mode client)
+     * ---------------------------------------------------------------------- */
     uint8_t *buff = (uint8_t *)mem_malloc(NTP_MSG_LEN);
-    if (!buff) { udp_remove(pcb); return; }
+    if (!buff)
+    {
+        udp_remove(pcb);
+        return;
+    }
 
     memset(buff, 0, NTP_MSG_LEN);
-    buff[0] = 0x1B; // LI=0, VN=3, Mode=3 (Client)
+    buff[0] = 0x1B;
+    /*
+        LI = 0 (pas d’avertissement)
+        VN = 3 (version du protocole NTP)
+        Mode = 3 (client)
+    */
 
+    /* LwIP : création d’un pbuf transport (UDP = transport layer) */
     p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
-    if (!p) { mem_free(buff); udp_remove(pcb); return; }
+    if (!p)
+    {
+        mem_free(buff);
+        udp_remove(pcb);
+        return;
+    }
 
     memcpy(p->payload, buff, NTP_MSG_LEN);
-    mem_free(buff);
+    mem_free(buff);   // Le buffer n’est plus nécessaire après copie
 
-    // Envoi de la requête
+
+    /* ----------------------------------------------------------------------
+     * 5) Envoi de la requête NTP au serveur (UDP port 123)
+     * ---------------------------------------------------------------------- */
     err = udp_sendto(pcb, p, &dest_ip, NTP_PORT);
+
+    /* Le pbuf doit être libéré après envoi */
     pbuf_free(p);
 
-    if (err == ERR_OK) {
-        // On ne ferme PAS le pcb ici ! On attend la réponse dans la callback.
-        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ NTP: Requete envoyee, attente...\r\n", 38, 100);
-    } else {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur envoi.\r\n", 22, 100);
-        udp_remove(pcb); // Si l'envoi échoue, on ferme tout de suite
+    if (err == ERR_OK)
+    {
+        /* ⚠️ On NE ferme PAS le PCB ici !
+           → ntp_recv_callback() fermera udp_remove(pcb)
+           après traitement de la réponse. */
+
+        HAL_UART_Transmit(&huart3,
+                          (uint8_t*)"✅ NTP: Requete envoyee, attente...\r\n",
+                          38,
+                          100);
+    }
+    else
+    {
+        HAL_UART_Transmit(&huart3,
+                          (uint8_t*)"❌ NTP: Erreur envoi.\r\n",
+                          22,
+                          100);
+
+        /* En cas d’erreur, il faut libérer le PCB immédiatement */
+        udp_remove(pcb);
     }
 }
+
 
 
 /* USER CODE END 4 */
@@ -1293,24 +1942,17 @@ void StartDefaultTask(void const * argument)
   extern struct netif gnetif;
     char msg[60];
 
-    // --- 1. ATTENTE RESEAU ---
+    // 1. DHCP
     HAL_UART_Transmit(&huart3, (uint8_t*)"⏳ Attente IP DHCP...\r\n", 24, 100);
-    while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) {
-        osDelay(500);
-    }
-
+    while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) { osDelay(500); }
     sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 
-    // --- 2. SYNCHRO NTP ---
+    // 2. NTP
     int retry_count = 0;
     while (ntp_synced == 0) {
         Sync_Time_NTP();
-        // On attend 2 secondes la réponse
-        for(int i=0; i<20; i++) {
-            osDelay(100);
-            if(ntp_synced) break;
-        }
+        for(int i=0; i<20; i++) { osDelay(100); if(ntp_synced) break; }
         if(ntp_synced == 0) {
             retry_count++;
             sprintf(msg, "⚠️ Pas de reponse NTP, tentative %d...\r\n", retry_count);
@@ -1318,44 +1960,34 @@ void StartDefaultTask(void const * argument)
         }
     }
 
-    // --- 3. SYSTEME PRET ---
+    // 3. PRET
     HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n", 44, 100);
-
-    uint8_t system_running = 0; // Variable d'état
+    uint8_t system_running = 0;
 
     for(;;) {
-        // Détection Bouton Bleu
         if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
-          // Anti-rebond
           osDelay(50);
           while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
 
           if (!system_running) {
-            // --- DEMARRAGE ---
             system_running = 1;
             HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
 
-            // Affichage de l'heure actuelle
             uint8_t h, m, s; RTC_GetTime(&h, &m, &s);
             sprintf(msg, "🕒 Heure systeme : %02d:%02d:%02d\r\n", h, m, s);
             HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 
-            			SeismicEvent last;
-                      // On met tout à 0 par sécurité avant de lire
-                      memset(&last, 0, sizeof(SeismicEvent));
+            // Lecture FRAM
+            SeismicEvent last;
+            memset(&last, 0, sizeof(SeismicEvent));
+            FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
+            if(last.intensity > 1.0f && last.intensity < 20000.0f && last.hour < 24) {
+                sprintf(msg, "💾 DERNIER SEISME (FRAM) : %02d:%02d:%02d (Force: %.0f)\r\n", last.hour, last.min, last.sec, last.intensity);
+            } else {
+                sprintf(msg, "💾 Pas de seisme valide en memoire FRAM.\r\n");
+            }
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 
-                      FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
-
-                      // Vérification de sécurité : Est-ce que les données semblent valides ?
-                      // (Intensité réaliste et heure cohérente 0-23h)
-                      if(last.intensity > 1.0f && last.intensity < 20000.0f && last.hour < 24) {
-                          sprintf(msg, "💾 DERNIER SEISME : %02d:%02d:%02d (Force: %.0f)\r\n", last.hour, last.min, last.sec, last.intensity);
-                      } else {
-                          sprintf(msg, "💾 Pas de seisme valide en memoire.\r\n");
-                      }
-                      HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-
-            // Réveil des tâches
             osThreadResume(heartBeatTaskHandle);
             osThreadResume(presenceTaskHandle);
             osThreadResume(logMessageTaskHandle);
@@ -1363,11 +1995,24 @@ void StartDefaultTask(void const * argument)
             osThreadResume(clientTaskHandle);
 
           } else {
-            // --- ARRET ---
             system_running = 0;
             HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STOPPED <<<\r\n", 26, 100);
 
-            // Suspension des tâches
+            // 💡 AFFICHAGE PREUVE MEMORISATION RAM
+            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n📊 HISTORIQUE VOISINS (RAM):\r\n", 32, 100);
+            for(int i=0; i<10; i++) {
+                sprintf(msg, "   [%d] Force recue: %.2f\r\n", i, neighbor_peaks[i]);
+                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+            }
+
+            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n📊 HISTORIQUE LOCAL (RAM):\r\n", 31, 100);
+            for(int i=0; i<10; i++) {
+                sprintf(msg, "   [%d] Force locale: %.2f\r\n", i, local_peaks[i]);
+                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+            }
+
+            HAL_UART_Transmit(&huart3, (uint8_t*)"--------------------------\r\n", 28, 100);
+
             osThreadSuspend(heartBeatTaskHandle);
             osThreadSuspend(presenceTaskHandle);
             osThreadSuspend(logMessageTaskHandle);
