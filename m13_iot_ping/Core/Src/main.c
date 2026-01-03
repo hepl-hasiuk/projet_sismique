@@ -32,10 +32,17 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+
+#include <stdarg.h>
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef struct {
+    char text[256];
+} UartMsg;
+
 
 /* USER CODE END PTD */
 
@@ -71,8 +78,13 @@ osThreadId clientTaskHandle;
 osThreadId serverTaskHandle;
 osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
-osMutexId uartMutexHandle;
+//osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
+#define UART_QUEUE_LEN 32
+
+static UartMsg uartMsgPool[UART_QUEUE_LEN];
+static uint8_t uartMsgPoolIndex = 0;
+
 
 /* -------------------------------------------------------------------------- */
 /*                  THREADS & BUFFERS LIES AUX CAPTEURS                       */
@@ -279,6 +291,7 @@ osSemaphoreId adcReadySemHandle;
 
 /* Mutex protégeant l'accès aux valeurs RMS partagées */
 osMutexId dataMutexHandle;
+osMutexId rtcMutexHandle; // 💡 A RAJOUTER
 
 /* -------------------------------------------------------------------------- */
 /*                          PROTOTYPES — RTC (I2C)                            */
@@ -314,10 +327,36 @@ void ntp_recv_callback(void *arg,
 void presence_listener_init(void);
 void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                       const ip_addr_t *addr, u16_t port);
+
+//gatekeeper
+
+void UART_Log(const char *fmt, ...);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void UART_Log(const char *fmt, ...)
+{
+    UartMsg *m;
+
+    taskENTER_CRITICAL();
+    m = &uartMsgPool[uartMsgPoolIndex];
+    uartMsgPoolIndex = (uartMsgPoolIndex + 1) % UART_QUEUE_LEN;
+    taskEXIT_CRITICAL();
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(m->text, sizeof(m->text), fmt, args);
+    va_end(args);
+
+    osMessagePut(messageQueueHandle, (uint32_t)m, 10);
+}
+
+
+
+
 
 /* USER CODE END 0 */
 
@@ -367,13 +406,17 @@ int main(void)
 
   /* Create the mutex(es) */
   /* definition and creation of uartMutex */
-  osMutexDef(uartMutex);
-  uartMutexHandle = osMutexCreate(osMutex(uartMutex));
+  //osMutexDef(uartMutex);
+  //uartMutexHandle = osMutexCreate(osMutex(uartMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
   osMutexDef(dataMutex);
   dataMutexHandle = osMutexCreate(osMutex(dataMutex));
+  osMutexDef(rtcMutex);
+  rtcMutexHandle = osMutexCreate(osMutex(rtcMutex)); // 💡 A RAJOUTER
+
+
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -395,8 +438,10 @@ int main(void)
 
   /* Create the queue(s) */
   /* definition and creation of messageQueue */
-  osMessageQDef(messageQueue, 16, uint32_t);
+  osMessageQDef(messageQueue, UART_QUEUE_LEN, uint32_t);
   messageQueueHandle = osMessageCreate(osMessageQ(messageQueue), NULL);
+
+
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -412,11 +457,11 @@ int main(void)
   logMessageTaskHandle = osThreadCreate(osThread(logMessageTask), NULL);
 
   /* definition and creation of clientTask */
-  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 1024);
   clientTaskHandle = osThreadCreate(osThread(clientTask), NULL);
 
   /* definition and creation of serverTask */
-  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 256);
+  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 1024);
   serverTaskHandle = osThreadCreate(osThread(serverTask), NULL);
 
   /* definition and creation of heartBeatTask */
@@ -442,7 +487,7 @@ int main(void)
   // pour attendre l'appui sur le bouton bleu.
   osThreadSuspend(heartBeatTaskHandle);
   osThreadSuspend(presenceTaskHandle);
-  osThreadSuspend(logMessageTaskHandle);
+  //osThreadSuspend(logMessageTaskHandle);
   osThreadSuspend(seismicTaskHandle);
   osThreadSuspend(clientTaskHandle);
   /* USER CODE END RTOS_THREADS */
@@ -971,6 +1016,8 @@ void send_presence_broadcast(void)
     pcb->so_options |= SOF_BROADCAST;
 
     /* 3. Adresse de broadcast (adaptée à ton réseau actuel) */
+   // ipaddr_aton("239.255.0.1", &dest_ip); // multicast
+
     ipaddr_aton("192.168.129.255", &dest_ip);
 
     /* Bind : on n’impose ni port source ni IP */
@@ -1012,6 +1059,8 @@ void send_presence_broadcast(void)
     /* 4. Envoi du message UDP en broadcast */
     err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
     (void)err;// empêche le warning "unused variable"
+    UART_Log("📤 UDP PRESENCE SENT => %s\r\n", json);
+
 
     /* ---------------------------------------------------------------------- */
     /*                          Libérations mémoire                           */
@@ -1162,7 +1211,8 @@ void StartSeismicTask(void const * argument)
                     max_val);
 
 
-                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                UART_Log("%s", msg);
+
                 last_print_time = HAL_GetTick();
             }
 
@@ -1210,8 +1260,8 @@ void StartSeismicTask(void const * argument)
                     my_alert_status = 0;
                     HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
 
-                    HAL_UART_Transmit(&huart3,
-                        (uint8_t*)"✅ Fin de l'alerte locale.\r\n", 30, 100);
+                    UART_Log("✅ Fin de l'alerte locale.\r\n");
+
                 }
             }
         }
@@ -1281,12 +1331,8 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     }
 
     /* ------------------------- LOG DE CONNEXION -------------------------- */
-    char msg[80];
-    sprintf(msg,
-            "📥 Client connecté depuis %s\r\n",
-            ipaddr_ntoa(&newpcb->remote_ip));
+    UART_Log("📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
 
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 
     /* ----------------------------------------------------------------------
      * Associer une fonction de réception TCP dédiée à cette connexion.
@@ -1335,7 +1381,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     // --- DEBUG 1 : On affiche ce qui RENTRE (La demande du voisin) ---
     char debug_msg[600];
     snprintf(debug_msg, sizeof(debug_msg), "\r\n[1] 📩 QUESTION RECUE du voisin :\r\n%s\r\n", buffer);
-    HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+    UART_Log("%s", debug_msg);
 
     // 3. Est-ce que c'est une demande de données ?
     if (strstr(buffer, "\"data_request\"") != NULL)
@@ -1366,7 +1412,8 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
         // Vérifie bien que cette ligne s'affiche dans ton terminal !
         char debug_tx[600];
         snprintf(debug_tx, sizeof(debug_tx), "[2] 📤 REPONSE ENVOYEE au voisin :\r\n%s\r\n\r\n", response);
-        HAL_UART_Transmit(&huart3, (uint8_t*)debug_tx, strlen(debug_tx), 100);
+        UART_Log("%s", debug_tx);
+
 
         // Envoi TCP
         tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
@@ -1400,10 +1447,8 @@ void send_data_request_tcp(const char *ip)
     struct tcp_pcb *pcb = tcp_new();
     if (!pcb)
     {
-        HAL_UART_Transmit(&huart3,
-                          (uint8_t*)"❌ tcp_new FAILED\r\n",
-                          20,
-                          HAL_MAX_DELAY);
+    	UART_Log("❌ tcp_new FAILED\r\n");
+
         return;
     }
 
@@ -1414,9 +1459,9 @@ void send_data_request_tcp(const char *ip)
     ipaddr_aton(ip, &dest_ip);
 
     /* Message UART d’information */
-    char msg[80];
-    snprintf(msg, sizeof(msg), "🔵 Connexion vers %s...\r\n", ip);
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+   // char msg[80];
+    UART_Log("🔵 Connexion vers %s...\r\n", ip);
+
 
 
     /* ----------------------------------------------------------------------
@@ -1431,9 +1476,8 @@ void send_data_request_tcp(const char *ip)
      * ---------------------------------------------------------------------- */
     if (err != ERR_OK)
     {
-        snprintf(msg, sizeof(msg),
-                 "❌ tcp_connect ERROR = %d\r\n", err);
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+    	UART_Log("❌ tcp_connect ERROR = %d\r\n", err);
+
 
         /* tcp_abort() détruit le PCB proprement (pas de fuite mémoire) */
         tcp_abort(pcb);
@@ -1521,7 +1565,7 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
     char debug_msg[600]; // Buffer un peu plus grand car les JSON peuvent être longs
         // On affiche ce qu'on a reçu avec un préfixe clair "RX CLIENT"
         snprintf(debug_msg, sizeof(debug_msg), "\r\n[RX CLIENT] >> %s\r\n", buffer);
-        HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
+        UART_Log("%s", debug_msg);
 
     /* Indiquer à LwIP que les données ont été traitées */
     tcp_recved(tpcb, p->tot_len);
@@ -1563,9 +1607,8 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         "%*[^0-9]%2hhu-%2hhu-%2hhuT%2hhu:%2hhu:%2hhu",
         &ny, &nmo, &nd, &nh, &nmin, &ns) != 6)
     {
-        HAL_UART_Transmit(&huart3,
-            (uint8_t*)"⚠️ Timestamp voisin invalide → FRAM non ecrite\r\n",
-            52, 100);
+    	UART_Log("⚠️ Timestamp voisin invalide → FRAM non ecrite\r\n");
+
         goto skip_neighbor_fram;
     }
 
@@ -1589,31 +1632,7 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 
 
     /* ------------------------- Gestion du statut voisin --------------------- */
-    if (is_alert)
-    {
-        neighbor_alert_status = 1;
 
-        char msg[60];
-        snprintf(msg, sizeof(msg),
-                 "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n",
-                 neighbor_max_rms);
-
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-    }
-    else
-    {
-        neighbor_alert_status = 0;
-    }
-
-    /* ------------------------- ALERTE COLLECTIVE --------------------------- */
-    if (my_alert_status && neighbor_alert_status)
-    {
-        HAL_UART_Transmit(&huart3,
-            (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n",
-            54,
-            100
-        );
-    }
 
 
     skip_neighbor_fram:
@@ -1630,7 +1649,7 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
                      "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n",
                      neighbor_max_rms);
 
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+            UART_Log("%s", msg);
         }
         else
         {
@@ -1640,14 +1659,11 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         /* ------------------------- ALERTE COLLECTIVE --------------------------- */
         if (my_alert_status && neighbor_alert_status)
         {
-            HAL_UART_Transmit(&huart3,
-                (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n",
-                54, 100);
+        	UART_Log("\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n");
+
         }
 
-        pbuf_free(p);
-        tcp_close(tpcb);
-        return ERR_OK;
+
 
     /* --------------------------- Nettoyage + fermeture ---------------------- */
     pbuf_free(p);
@@ -1703,18 +1719,25 @@ int bcdToDec(uint8_t val)
   * @param sec   Secondes (0–59)
  * */
 
+/* -------------------------------------------------------------------------- */
+/* FONCTIONS RTC SÉCURISÉES (AVEC MUTEX)                               */
+/* -------------------------------------------------------------------------- */
+
 void RTC_SetDateTime(uint8_t year, uint8_t month, uint8_t day,
                      uint8_t hour, uint8_t min, uint8_t sec)
 {
     uint8_t data[7];
 
-    data[0] = decToBcd(sec);    // 0x00
-    data[1] = decToBcd(min);    // 0x01
-    data[2] = decToBcd(hour);   // 0x02
-    data[3] = decToBcd(1);      // 0x03 weekday (dummy)
-    data[4] = decToBcd(day);    // 0x04
-    data[5] = decToBcd(month);  // 0x05
-    data[6] = decToBcd(year);   // 0x06
+    data[0] = decToBcd(sec);
+    data[1] = decToBcd(min);
+    data[2] = decToBcd(hour);
+    data[3] = decToBcd(1);
+    data[4] = decToBcd(day);
+    data[5] = decToBcd(month);
+    data[6] = decToBcd(year);
+
+    // 🔒 PROTECTION I2C (INDISPENSABLE ICI AUSSI)
+    osMutexWait(rtcMutexHandle, osWaitForever);
 
     HAL_I2C_Mem_Write(&hi2c1,
                       RTC_ADDR,
@@ -1723,10 +1746,17 @@ void RTC_SetDateTime(uint8_t year, uint8_t month, uint8_t day,
                       data,
                       7,
                       1000);
+
+    // 🔓 LIBÉRATION
+    osMutexRelease(rtcMutexHandle);
 }
+
 void RTC_GetDateTime(RTC_DateTime *dt)
 {
     uint8_t data[7];
+
+    // 🔒 PROTECTION I2C
+    osMutexWait(rtcMutexHandle, osWaitForever);
 
     HAL_I2C_Mem_Read(&hi2c1,
                      RTC_ADDR,
@@ -1736,6 +1766,9 @@ void RTC_GetDateTime(RTC_DateTime *dt)
                      7,
                      1000);
 
+    // 🔓 LIBÉRATION
+    osMutexRelease(rtcMutexHandle);
+
     dt->sec   = bcdToDec(data[0] & 0x7F);
     dt->min   = bcdToDec(data[1]);
     dt->hour  = bcdToDec(data[2]);
@@ -1744,53 +1777,36 @@ void RTC_GetDateTime(RTC_DateTime *dt)
     dt->year  = bcdToDec(data[6]);
 }
 
-
 void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec)
 {
     uint8_t data[3];
 
-    data[0] = decToBcd(sec);   // Registre 0x00 : Secondes
-    data[1] = decToBcd(min);   // Registre 0x01 : Minutes
-    data[2] = decToBcd(hour);  // Registre 0x02 : Heures
+    data[0] = decToBcd(sec);
+    data[1] = decToBcd(min);
+    data[2] = decToBcd(hour);
 
-    /*
-     * On écrit dans le RTC (adresse 0xD0) à partir du registre 0x00.
-     * HAL_I2C_Mem_Write() gère :
-     *   - START condition
-     *   - Adresse écriture
-     *   - Registre interne
-     *   - Envoi des données
-     *   - STOP condition
-     */
+    // 🔒 PROTECTION I2C
+    osMutexWait(rtcMutexHandle, osWaitForever);
+
     HAL_I2C_Mem_Write(&hi2c1,
                       RTC_ADDR,
-                      0x00,          // Adresse du premier registre (sec)
-                      1,             // Taille adresse registre (1 octet)
+                      0x00,
+                      1,
                       data,
-                      3,             // 3 octets : sec / min / hour
+                      3,
                       1000);
+
+    // 🔓 LIBÉRATION
+    osMutexRelease(rtcMutexHandle);
 }
-/**
-  * @brief Lit l'heure courante depuis le RTC.
-  *
-  * Rôle :
-  *   ✔ Lire 3 registres : secondes, minutes, heures
-  *   ✔ Convertir du format BCD vers décimal
-  *
-  * Note importante :
-  *   data[0] contient un bit spécial (CH = Clock Halt).
-  *   → On masque avec 0x7F pour ne garder que les 7 bits utiles.
-  *
-  * @param hour  Pointeur où stocker l'heure
-  * @param min   Pointeur où stocker les minutes
-  * @param sec   Pointeur où stocker les secondes
-  */
 
 void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec)
 {
     uint8_t data[3];
 
-    /* Lecture séquentielle des registres 0x00, 0x01, 0x02 */
+    // 🔒 PROTECTION I2C
+    osMutexWait(rtcMutexHandle, osWaitForever);
+
     HAL_I2C_Mem_Read(&hi2c1,
                      RTC_ADDR,
                      0x00,
@@ -1799,11 +1815,13 @@ void RTC_GetTime(uint8_t *hour, uint8_t *min, uint8_t *sec)
                      3,
                      1000);
 
-    *sec  = bcdToDec(data[0] & 0x7F);  // Retirer le bit CH (Clock Halt)
+    // 🔓 LIBÉRATION
+    osMutexRelease(rtcMutexHandle);
+
+    *sec  = bcdToDec(data[0] & 0x7F);
     *min  = bcdToDec(data[1]);
     *hour = bcdToDec(data[2]);
 }
-
 // --- DRIVER FRAM (CY15B104Q via SPI2) ---
 
 
@@ -1989,7 +2007,7 @@ void ntp_recv_callback(void *arg,
                 t->tm_hour,
                 t->tm_min,
                 t->tm_sec);
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+        UART_Log("%s", msg);
 
 
 
@@ -2048,12 +2066,12 @@ void Sync_Time_NTP(void)
         ntp_pcb = NULL;
     }
 
-    HAL_UART_Transmit(&huart3, (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n", 44, 100);
+    UART_Log("🌍 NTP: Connexion au serveur de temps...\r\n");
 
     /* 2. Création du nouveau PCB UDP */
     ntp_pcb = udp_new();
     if (!ntp_pcb) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur alloc PCB (Memoire pleine)\r\n", 44, 100);
+    	UART_Log("❌ NTP: Erreur alloc PCB (Memoire pleine)\r\n");
         return;
     }
 
@@ -2089,9 +2107,9 @@ void Sync_Time_NTP(void)
     pbuf_free(p);
 
     if (err == ERR_OK) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ NTP: Requete envoyee...\r\n", 29, 100);
+    	UART_Log("✅ NTP: Requete envoyee...\r\n");
     } else {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur envoi.\r\n", 22, 100);
+    	UART_Log("❌ NTP: Erreur envoi.\r\n");
         // En cas d'erreur immédiate, on libère tout de suite
         udp_remove(ntp_pcb);
         ntp_pcb = NULL;
@@ -2105,20 +2123,20 @@ void presence_listener_init(void)
 {
     presence_rx_pcb = udp_new();
     if (!presence_rx_pcb) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ UDP RX PCB alloc failed\r\n", 28, 100);
+    	UART_Log("❌ UDP RX PCB alloc failed\r\n");
         return;
     }
 
     // On écoute sur PRESENCE_PORT sur toutes les IP
     if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) != ERR_OK) {
-        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ udp_bind presence failed\r\n", 28, 100);
+    	UART_Log("❌ udp_bind presence failed\r\n");
         udp_remove(presence_rx_pcb);
         presence_rx_pcb = NULL;
         return;
     }
 
     udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
-    HAL_UART_Transmit(&huart3, (uint8_t*)"✅ UDP presence listener ON\r\n", 28, 100);
+    UART_Log("✅ UDP presence listener ON\r\n");
 }
 
 void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
@@ -2126,31 +2144,26 @@ void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     if (!p) return;
 
-    // Copie sûre du payload
     char buf[300];
-    uint16_t n = (p->tot_len < sizeof(buf) - 1) ? p->tot_len : (sizeof(buf) - 1);
-    pbuf_copy_partial(p, buf, n, 0);
-    buf[n] = '\0';
+    uint16_t len = p->tot_len;
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
 
-    // Filtre: on log seulement si ça ressemble à une presence
-    if (strstr(buf, "\"type\"") && strstr(buf, "presence"))
+    pbuf_copy_partial(p, buf, len, 0);
+    buf[len] = '\0';
+
+    /* 🔥 LOG TOUJOURS LE PAYLOAD (COMME TON AMI) */
+    UART_Log("\r\n======> UDP RX from %s:%u <======\r\n%s\r\n",
+             ipaddr_ntoa(addr), port, buf);
+
+    /* Filtrage SIMPLE */
+    if (strstr(buf, "presence"))
     {
-        // anti-spam: max 1 log / 300 ms
-        uint32_t now = HAL_GetTick();
-        if (now - last_presence_print_ms > 300)
-        {
-            last_presence_print_ms = now;
-
-            char msg[420];
-            int len = snprintf(msg, sizeof(msg),
-                               "📡 UDP PRESENCE RX from %s:%u => %s\r\n",
-                               ipaddr_ntoa(addr), port, buf);
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, 100);
-        }
+        UART_Log("➡️ Presence detectee\r\n");
     }
 
     pbuf_free(p);
 }
+
 
 
 /* USER CODE END 4 */
@@ -2179,12 +2192,13 @@ void StartDefaultTask(void const * argument)
     char msg[60];
 
     // 1. DHCP
-    HAL_UART_Transmit(&huart3, (uint8_t*)"⏳ Attente IP DHCP...\r\n", 24, 100);
+    UART_Log("⏳ Attente IP DHCP...\r\n");
+
     while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) { osDelay(500); }
     sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+    UART_Log("%s", msg);
 
-    presence_listener_init(); //udp recive
+    //presence_listener_init(); //udp recive
 
     // 2. NTP
     int retry_count = 0;
@@ -2194,12 +2208,12 @@ void StartDefaultTask(void const * argument)
         if(ntp_synced == 0) {
             retry_count++;
             sprintf(msg, "⚠️ Pas de reponse NTP, tentative %d...\r\n", retry_count);
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+            UART_Log("%s", msg);
         }
     }
 
     // 3. PRET
-    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n", 44, 100);
+    UART_Log("\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n");
     uint8_t system_running = 0;
 
     for(;;) {
@@ -2209,14 +2223,14 @@ void StartDefaultTask(void const * argument)
 
           if (!system_running) {
             system_running = 1;
-            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
+            UART_Log("\r\n>>> SYSTEM STARTED <<<\r\n");
 
             RTC_DateTime dt;
             RTC_GetDateTime(&dt);
             snprintf(msg, sizeof(msg),
                      "🕒 Heure systeme : %02d:%02d:%02d\r\n",
                      dt.hour, dt.min, dt.sec);
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+            UART_Log("%s", msg);
 
 
 
@@ -2244,7 +2258,7 @@ void StartDefaultTask(void const * argument)
                       nevt.hour, nevt.min, nevt.sec,
                       nevt.intensity);
 
-                    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                    UART_Log("%s", msg);
                 }
             }
 
@@ -2258,36 +2272,36 @@ void StartDefaultTask(void const * argument)
             } else {
                 sprintf(msg, "💾 Pas de seisme valide en memoire FRAM.\r\n");
             }
-            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
-
+            UART_Log("%s", msg);
+            presence_listener_init();
             osThreadResume(heartBeatTaskHandle);
             osThreadResume(presenceTaskHandle);
-            osThreadResume(logMessageTaskHandle);
+            //osThreadResume(logMessageTaskHandle);
             osThreadResume(seismicTaskHandle);
             osThreadResume(clientTaskHandle);
 
           } else {
             system_running = 0;
-            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STOPPED <<<\r\n", 26, 100);
+            UART_Log("\r\n>>> SYSTEM STOPPED <<<\r\n");
 
             // 💡 AFFICHAGE PREUVE MEMORISATION RAM
-            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n📊 HISTORIQUE VOISINS (RAM):\r\n", 32, 100);
+            UART_Log("\r\n📊 HISTORIQUE VOISINS (RAM):\r\n");
             for(int i=0; i<10; i++) {
                 sprintf(msg, "   [%d] Force recue: %.2f\r\n", i, neighbor_peaks[i]);
-                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                UART_Log("%s", msg);
             }
 
-            HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n📊 HISTORIQUE LOCAL (RAM):\r\n", 31, 100);
+            UART_Log("\r\n📊 HISTORIQUE LOCAL (RAM):\r\n");
             for(int i=0; i<10; i++) {
                 sprintf(msg, "   [%d] Force locale: %.2f\r\n", i, local_peaks[i]);
-                HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                UART_Log("%s", msg);
             }
 
-            HAL_UART_Transmit(&huart3, (uint8_t*)"--------------------------\r\n", 28, 100);
+            UART_Log("--------------------------\r\n");
 
             osThreadSuspend(heartBeatTaskHandle);
             osThreadSuspend(presenceTaskHandle);
-            osThreadSuspend(logMessageTaskHandle);
+            //osThreadSuspend(logMessageTaskHandle);
             osThreadSuspend(seismicTaskHandle);
             osThreadSuspend(clientTaskHandle);
           }
@@ -2309,43 +2323,19 @@ void LogMessageTask(void const * argument)
 {
   /* USER CODE BEGIN LogMessageTask */
   /* Infinite loop */
-  char msg[80];
-  for(;;)
-  {
-    uint16_t ax = adc_raw[0];
-    uint16_t ay = adc_raw[1];
-    uint16_t az = adc_raw[2];
-    uint32_t t = HAL_GetTick();
+    for (;;)
+    {
+        osEvent evt = osMessageGet(messageQueueHandle, osWaitForever);
+        if (evt.status == osEventMessage)
+        {
+            UartMsg *m = (UartMsg *)evt.value.p;
 
-    int len;
-    // Log des valeurs brutes ADC
-    len = snprintf(msg, sizeof(msg), "[%8lu ms] X=%4u Y=%4u Z=%4u\r\n", t, ax, ay, az);
-    HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
-
-    /* affichage temporaire pour verifier les RMS*/
-    // Log des valeurs calculées RMS
-    /* affichage temporaire pour verifier les RMS*/
-
-        // 💡 CORRECTION : Lecture protégée par Mutex
-        float log_x, log_y, log_z;
-        osMutexWait(dataMutexHandle, osWaitForever);
-        log_x = rms_x;
-        log_y = rms_y;
-        log_z = rms_z;
-        osMutexRelease(dataMutexHandle);
-
-        // Log des valeurs calculées RMS (avec les copies locales)
-        len = snprintf(msg, sizeof(msg),
-           "[%lu ms] RMS: X=%.2f Y=%.2f Z=%.2f\r\n", t, log_x, log_y, log_z);
-        HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, HAL_MAX_DELAY);
-
-
-    /*connect to qq1*/
-
-
- /*Time uart envoie données*/
-    osDelay(1000); // ≈10 Hz => recommandé en debug
-  }
+            HAL_UART_Transmit(&huart3,
+                              (uint8_t*)m->text,
+                              strlen(m->text),
+                              HAL_MAX_DELAY);
+        }
+    }
   /* USER CODE END LogMessageTask */
 }
 
@@ -2376,7 +2366,7 @@ void StartClientTask(void const * argument)
     const char *node_list[] = {
     		"192.168.129.177",
 			"192.168.129.190",
-    		"192.168.129.27"};
+    		"192.168.129.7"};
     const uint8_t node_count = 3;
 
     /*const uint8_t node_count = 4;*/ /* changer absolument quand je rajoute une ip*/
@@ -2408,7 +2398,7 @@ void StartServerTask(void const * argument)
     extern struct netif gnetif;
     while (!netif_is_up(&gnetif))
         osDelay(100);
-    HAL_UART_Transmit(&huart3, (uint8_t*)"SERVER TASK STARTED\r\n", 21, HAL_MAX_DELAY);
+    UART_Log("SERVER TASK STARTED\r\n");
 
     tcp_server_init(); // <-- nouveau serveur TCP (mise en écoute)
     for(;;)
