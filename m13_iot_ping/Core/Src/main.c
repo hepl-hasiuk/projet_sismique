@@ -17,7 +17,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "main.h"//20h22=13d2025
+#include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
 
@@ -83,6 +83,7 @@ osThreadId presenceTaskHandle;
 
 /* Buffer contenant les 3 valeurs ADC brutes (X, Y, Z) */
 uint16_t adc_raw[3];
+struct udp_pcb *ntp_pcb = NULL;
 
 /* -------------------------------------------------------------------------- */
 /*                           VARIABLES SISMIQUES                              */
@@ -111,17 +112,38 @@ float buf_z[WINDOW_SIZE];
 #define FRAM_WRITE       0x02   // Ecriture séquentielle
 #define FRAM_READ        0x03   // Lecture séquentielle
 
+//voisin
+#define FRAM_LOCAL_EVENT_ADDR     0x0000
+#define FRAM_NEIGHBOR_BASE_ADDR   0x0100
+#define FRAM_NEIGHBOR_STRIDE      sizeof(NeighborEvent)
+
+
 /* Adresse de stockage principal dans la FRAM (boîte noire) */
-#define FRAM_EVENT_ADDR  0x10
+//#define FRAM_EVENT_ADDR  0x10
 
 /* Structure enregistrée dans la FRAM pour mémoriser un séisme */
 typedef struct {
-    uint8_t hour;       // Heure de l'évènement
-    uint8_t min;        // Minute
-    uint8_t sec;        // Seconde
-    uint8_t reserved;   // Alignement mémoire (non utilisé)
-    float intensity;    // RMS maximale détectée
+    uint8_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t min;
+    uint8_t sec;
+    float intensity;
 } SeismicEvent;
+
+
+/* --- Événement reçu d’un voisin --- */
+typedef struct {
+    uint8_t neighbor_id;   // index du voisin (0,1,2…)
+    uint8_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t min;
+    uint8_t sec;
+    float intensity;
+} NeighborEvent;
 
 /* -------------------------------------------------------------------------- */
 /*                       INTELLIGENCE COLLECTIVE (ÉTAPE 3)                    */
@@ -154,7 +176,7 @@ uint8_t local_idx = 0;
 /* -------------------------------------------------------------------------- */
 
 /* Serveur NTP utilisé (Google : fiable + répond vite) */
-#define NTP_SERVER_IP "216.239.35.0"
+#define NTP_SERVER_IP "162.159.200.1" //"216.239.35.0"
 
 /* Paramètres standard du protocole NTP */
 #define NTP_PORT 123
@@ -189,6 +211,22 @@ void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
+void build_iso8601_timestamp(char *buf, size_t len);
+
+typedef struct {
+    uint8_t year;
+    uint8_t month;
+    uint8_t day;
+    uint8_t hour;
+    uint8_t min;
+    uint8_t sec;
+} RTC_DateTime;
+
+void RTC_SetDateTime(uint8_t year, uint8_t month, uint8_t day,
+                     uint8_t hour, uint8_t min, uint8_t sec);
+
+void RTC_GetDateTime(RTC_DateTime *dt);
+
 /* -------------------------------------------------------------------------- */
 /*                     PROTOTYPES — TÂCHES FREE RTOS                          */
 /* -------------------------------------------------------------------------- */
@@ -271,6 +309,11 @@ void ntp_recv_callback(void *arg,
                        struct pbuf *p,
                        const ip_addr_t *addr,
                        u16_t port);
+
+/* --- Réception présence UDP --- */
+void presence_listener_init(void);
+void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                      const ip_addr_t *addr, u16_t port);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -361,19 +404,19 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 2048);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 256);
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* definition and creation of logMessageTask */
-  osThreadDef(logMessageTask, LogMessageTask, osPriorityNormal, 0, 512);
+  osThreadDef(logMessageTask, LogMessageTask, osPriorityNormal, 0, 256);
   logMessageTaskHandle = osThreadCreate(osThread(logMessageTask), NULL);
 
   /* definition and creation of clientTask */
-  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 1024);
+  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 256);
   clientTaskHandle = osThreadCreate(osThread(clientTask), NULL);
 
   /* definition and creation of serverTask */
-  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 1024);
+  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 256);
   serverTaskHandle = osThreadCreate(osThread(serverTask), NULL);
 
   /* definition and creation of heartBeatTask */
@@ -866,6 +909,8 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+
+
 /**
   * @brief Tâche pour la découverte réseau (Protocole de présence)
   * @note  Envoie périodiquement un broadcast UDP pour dire "Je suis là"
@@ -941,10 +986,14 @@ void send_presence_broadcast(void)
     extern struct netif gnetif;
     char *device_ip = ipaddr_ntoa(&gnetif.ip_addr);
 
+    char ts[32];
+    build_iso8601_timestamp(ts, sizeof(ts));
+
     snprintf(json, sizeof(json),
-        "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", "
-        "\"timestamp\": \"2025-10-02T08:20:00Z\" }",
-        device_ip);
+     "{ \"type\": \"presence\", \"id\": \"nucleo-8\", \"ip\": \"%s\", "
+     "\"timestamp\": \"%s\" }",
+     device_ip, ts);
+
 
     /* ---------------------------------------------------------------------- */
     /*               Allocation d’un pbuf contenant le JSON                   */
@@ -1103,12 +1152,15 @@ void StartSeismicTask(void const * argument)
                 if (calc_rms_y > max_val) max_val = calc_rms_y;
                 if (calc_rms_z > max_val) max_val = calc_rms_z;
 
-                uint8_t h, m, s;
-                RTC_GetTime(&h, &m, &s);
+                RTC_DateTime dt;
+                RTC_GetDateTime(&dt);
 
                 sprintf(msg,
-                    "[%02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL — RMS max: %.2f\r\n",
-                    h, m, s, max_val);
+                    "[20%02d-%02d-%02d %02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL — RMS max: %.2f\r\n",
+                    dt.year, dt.month, dt.day,
+                    dt.hour, dt.min, dt.sec,
+                    max_val);
+
 
                 HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
                 last_print_time = HAL_GetTick();
@@ -1128,11 +1180,21 @@ void StartSeismicTask(void const * argument)
                 local_idx = (local_idx + 1) % 10;
 
                 /* Horodatage RTC */
-                uint8_t h, m, s;
-                RTC_GetTime(&h, &m, &s);
+                RTC_DateTime dt;
+                RTC_GetDateTime(&dt);
 
-                SeismicEvent evt = {h, m, s, 0, max_val};
-                FRAM_Write(FRAM_EVENT_ADDR, (uint8_t*)&evt, sizeof(evt));
+                SeismicEvent evt = {
+                    dt.year,
+                    dt.month,
+                    dt.day,
+                    dt.hour,
+                    dt.min,
+                    dt.sec,
+                    max_val
+                };
+
+                FRAM_Write(FRAM_LOCAL_EVENT_ADDR, (uint8_t*)&evt, sizeof(evt));
+
 
                 HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
                 last_save_time = HAL_GetTick();
@@ -1249,73 +1311,70 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
   *   p->payload contient uniquement la charge utile du paquet TCP
  *
  * */
+/*
+ * Fonction appelée automatiquement lorsqu’un client envoie
+ * des données au serveur TCP.
+ */
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-    /* --------------------------- Validation entrée ------------------------- */
-    if (err != ERR_OK || p == NULL)
-    {
-        /* Si p existe encore, on doit libérer la mémoire */
+    // 1. Vérification standard
+    if (err != ERR_OK || p == NULL) {
         if (p) pbuf_free(p);
-
-        /* Fermeture propre de la connexion */
         tcp_close(tpcb);
-
         return ERR_OK;
     }
 
-    /* ------------------------- Lecture du message reçu --------------------- */
-    char buffer[256];
+    // 2. Copie du message reçu dans un buffer
+    char buffer[512];
     uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
-
     memcpy(buffer, p->payload, len);
-    buffer[len] = '\0';   // Sécurisation : fin de chaîne
+    buffer[len] = '\0';
 
-    /* Indique à LwIP que nous avons traité ces octets */
-    tcp_recved(tpcb, p->tot_len);
+    tcp_recved(tpcb, p->tot_len); // On dit à LwIP qu'on a bien reçu
 
+    // --- DEBUG 1 : On affiche ce qui RENTRE (La demande du voisin) ---
+    char debug_msg[600];
+    snprintf(debug_msg, sizeof(debug_msg), "\r\n[1] 📩 QUESTION RECUE du voisin :\r\n%s\r\n", buffer);
+    HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
 
-    /* ----------------------------------------------------------------------
-     *  Traitement : Le client demande une mesure ?
-     * ---------------------------------------------------------------------- */
+    // 3. Est-ce que c'est une demande de données ?
     if (strstr(buffer, "\"data_request\"") != NULL)
     {
+        // Récupération des données
         float tx_x, tx_y, tx_z;
-
-        /* Lecture thread-safe des données RMS */
         osMutexWait(dataMutexHandle, osWaitForever);
-        tx_x = rms_x;
-        tx_y = rms_y;
-        tx_z = rms_z;
+        tx_x = rms_x; tx_y = rms_y; tx_z = rms_z;
         osMutexRelease(dataMutexHandle);
 
-        /* --------------------------------------------------------------
-         * Construction de la réponse JSON
-         * -------------------------------------------------------------- */
-        char response[300];
-        uint8_t h, m, s;
-        RTC_GetTime(&h, &m, &s);
+
+
+        // 4. Construction de la RÉPONSE (C'est CA que le voisin va recevoir)
+        char response[512];
+        char ts[32];
+        build_iso8601_timestamp(ts, sizeof(ts));
 
         snprintf(response, sizeof(response),
-             "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-             "\"timestamp\": \"%02d:%02d:%02d\", "
-             "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-             "\"status\": \"%s\" }",
-             h, m, s,
-             tx_x, tx_y, tx_z,
-             my_alert_status ? "alert" : "normal"
-        );
+         "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+         "\"timestamp\": \"%s\", "
+         "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+         "\"status\": \"%s\" }",
+         ts, tx_x, tx_y, tx_z,
+         my_alert_status ? "alert" : "normal");
 
-        /* Envoi de la réponse TCP */
+
+        // --- DEBUG 2 : On affiche ce qui SORT (Ta réponse) ---
+        // Vérifie bien que cette ligne s'affiche dans ton terminal !
+        char debug_tx[600];
+        snprintf(debug_tx, sizeof(debug_tx), "[2] 📤 REPONSE ENVOYEE au voisin :\r\n%s\r\n\r\n", response);
+        HAL_UART_Transmit(&huart3, (uint8_t*)debug_tx, strlen(debug_tx), 100);
+
+        // Envoi TCP
         tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
         tcp_output(tpcb);
-
-        /* Connexion fermée après réponse */
         tcp_close(tpcb);
     }
 
-    /* Nettoyage indispensable du buffer LwIP */
     pbuf_free(p);
-
     return ERR_OK;
 }
 
@@ -1410,16 +1469,20 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
      *    { "type": "data_request", "from": "...", "to": "...", "timestamp": ... }
      * ---------------------------------------------------------------------- */
     char sendbuf[256];
-    int len = snprintf(sendbuf, sizeof(sendbuf),
-         "{ \"type\": \"data_request\", \"from\": \"nucleo-8\", \"to\": \"%s\", "
-         "\"timestamp\": \"2025-10-02T08:21:00Z\" }",
-         ipaddr_ntoa(&tpcb->remote_ip)
-    );
+    char ts[32];
+    build_iso8601_timestamp(ts, sizeof(ts));
+
+    snprintf(sendbuf, sizeof(sendbuf),
+     "{ \"type\": \"data_request\", \"from\": \"nucleo-8\", \"to\": \"%s\", "
+     "\"timestamp\": \"%s\" }",
+     ipaddr_ntoa(&tpcb->remote_ip), ts);
+
 
     /* ----------------------------------------------------------------------
      * 3) Envoi de la requête JSON vers le voisin
      * ---------------------------------------------------------------------- */
-    tcp_write(tpcb, sendbuf, len, TCP_WRITE_FLAG_COPY);
+    tcp_write(tpcb, sendbuf, strlen(sendbuf), TCP_WRITE_FLAG_COPY);
+
     tcp_output(tpcb);
 
     /* ⚠️ IMPORTANT : on NE ferme PAS la connexion ici !
@@ -1455,6 +1518,10 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 
     memcpy(buffer, p->payload, len);
     buffer[len] = '\0';
+    char debug_msg[600]; // Buffer un peu plus grand car les JSON peuvent être longs
+        // On affiche ce qu'on a reçu avec un préfixe clair "RX CLIENT"
+        snprintf(debug_msg, sizeof(debug_msg), "\r\n[RX CLIENT] >> %s\r\n", buffer);
+        HAL_UART_Transmit(&huart3, (uint8_t*)debug_msg, strlen(debug_msg), 100);
 
     /* Indiquer à LwIP que les données ont été traitées */
     tcp_recved(tpcb, p->tot_len);
@@ -1475,6 +1542,7 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         if (ptr_x) sscanf(ptr_x + 4, "%f", &rx_x);
         if (ptr_y) sscanf(ptr_y + 4, "%f", &rx_y);
         if (ptr_z) sscanf(ptr_z + 4, "%f", &rx_z);
+
     }
 
     /* Déterminer le RMS maximum chez le voisin */
@@ -1483,8 +1551,42 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
     if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
 
     /* ----------------------- Stockage RAM (exigence prof) ------------------ */
-    neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+    neighbor_peaks[neighbor_idx] = neighbor_max_rms;   // RAM: 10 valeurs
+    uint8_t neighbor_id = neighbor_idx % 3;            // FRAM: 3 voisins
     neighbor_idx = (neighbor_idx + 1) % 10;
+
+    uint8_t ny = 0, nmo = 0, nd = 0, nh = 0, nmin = 0, ns = 0;
+
+
+
+    if (sscanf(buffer,
+        "%*[^0-9]%2hhu-%2hhu-%2hhuT%2hhu:%2hhu:%2hhu",
+        &ny, &nmo, &nd, &nh, &nmin, &ns) != 6)
+    {
+        HAL_UART_Transmit(&huart3,
+            (uint8_t*)"⚠️ Timestamp voisin invalide → FRAM non ecrite\r\n",
+            52, 100);
+        goto skip_neighbor_fram;
+    }
+
+    NeighborEvent nevt;
+
+    nevt.neighbor_id = neighbor_id;
+  // ou index du node_list
+    nevt.year  = ny;
+    nevt.month = nmo;
+    nevt.day   = nd;
+    nevt.hour  = nh;
+    nevt.min   = nmin;
+    nevt.sec   = ns;
+    nevt.intensity = neighbor_max_rms;
+
+    uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR +
+                    (neighbor_id * FRAM_NEIGHBOR_STRIDE);
+
+
+    FRAM_Write(addr, (uint8_t*)&nevt, sizeof(nevt));
+
 
     /* ------------------------- Gestion du statut voisin --------------------- */
     if (is_alert)
@@ -1492,7 +1594,10 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         neighbor_alert_status = 1;
 
         char msg[60];
-        sprintf(msg, "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n", neighbor_max_rms);
+        snprintf(msg, sizeof(msg),
+                 "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n",
+                 neighbor_max_rms);
+
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
     }
     else
@@ -1509,6 +1614,40 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
             100
         );
     }
+
+
+    skip_neighbor_fram:
+        /* Si timestamp invalide, on saute juste l’écriture FRAM,
+           mais on garde le reste (status, alerte, etc.) */
+
+        /* ------------------------- Gestion du statut voisin --------------------- */
+        if (is_alert)
+        {
+            neighbor_alert_status = 1;
+
+            char msg[60];
+            snprintf(msg, sizeof(msg),
+                     "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n",
+                     neighbor_max_rms);
+
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+        }
+        else
+        {
+            neighbor_alert_status = 0;
+        }
+
+        /* ------------------------- ALERTE COLLECTIVE --------------------------- */
+        if (my_alert_status && neighbor_alert_status)
+        {
+            HAL_UART_Transmit(&huart3,
+                (uint8_t*)"\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n",
+                54, 100);
+        }
+
+        pbuf_free(p);
+        tcp_close(tpcb);
+        return ERR_OK;
 
     /* --------------------------- Nettoyage + fermeture ---------------------- */
     pbuf_free(p);
@@ -1563,6 +1702,47 @@ int bcdToDec(uint8_t val)
   * @param min   Minutes  (0–59)
   * @param sec   Secondes (0–59)
  * */
+
+void RTC_SetDateTime(uint8_t year, uint8_t month, uint8_t day,
+                     uint8_t hour, uint8_t min, uint8_t sec)
+{
+    uint8_t data[7];
+
+    data[0] = decToBcd(sec);    // 0x00
+    data[1] = decToBcd(min);    // 0x01
+    data[2] = decToBcd(hour);   // 0x02
+    data[3] = decToBcd(1);      // 0x03 weekday (dummy)
+    data[4] = decToBcd(day);    // 0x04
+    data[5] = decToBcd(month);  // 0x05
+    data[6] = decToBcd(year);   // 0x06
+
+    HAL_I2C_Mem_Write(&hi2c1,
+                      RTC_ADDR,
+                      0x00,
+                      1,
+                      data,
+                      7,
+                      1000);
+}
+void RTC_GetDateTime(RTC_DateTime *dt)
+{
+    uint8_t data[7];
+
+    HAL_I2C_Mem_Read(&hi2c1,
+                     RTC_ADDR,
+                     0x00,
+                     1,
+                     data,
+                     7,
+                     1000);
+
+    dt->sec   = bcdToDec(data[0] & 0x7F);
+    dt->min   = bcdToDec(data[1]);
+    dt->hour  = bcdToDec(data[2]);
+    dt->day   = bcdToDec(data[4]);
+    dt->month = bcdToDec(data[5]);
+    dt->year  = bcdToDec(data[6]);
+}
 
 
 void RTC_SetTime(uint8_t hour, uint8_t min, uint8_t sec)
@@ -1783,31 +1963,62 @@ void ntp_recv_callback(void *arg,
         /* ------------------------------------------------------------------
          * 5) Conversion epoch → h/m/s
          * ------------------------------------------------------------------ */
-        uint8_t h = (unix_time / 3600) % 24;
-        uint8_t m = (unix_time / 60)  % 60;
-        uint8_t s =  unix_time        % 60;
 
-        /* ------------------------------------------------------------------
-         * 6) Mise à l’heure du RTC matériel
-         * ------------------------------------------------------------------ */
-        RTC_SetTime(h, m, s);
-        ntp_synced = 1;   // Indique au système que l'heure est correcte
 
-        /* ------------------------------------------------------------------
-         * 7) Feedback UART pour debug
-         * ------------------------------------------------------------------ */
-        char msg[64];
-        sprintf(msg, "✅ HEURE SYNC NTP : %02d:%02d:%02d\r\n", h, m, s);
+        time_t raw = unix_time;
+        struct tm *t = gmtime(&raw);
+
+        RTC_SetDateTime(
+            t->tm_year % 100,    // année (25)
+            t->tm_mon + 1,       // mois 1–12
+            t->tm_mday,          // jour
+            t->tm_hour,
+            t->tm_min,
+            t->tm_sec
+        );
+
+        ntp_synced = 1;
+
+        /* Feedback UART */
+        char msg[80];
+        sprintf(msg,
+                "✅ RTC SYNC NTP : 20%02d-%02d-%02d %02d:%02d:%02d\r\n",
+                t->tm_year % 100,
+                t->tm_mon + 1,
+                t->tm_mday,
+                t->tm_hour,
+                t->tm_min,
+                t->tm_sec);
         HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+
+
+
     }
+
+
+
 
     /* ----------------------------------------------------------------------
      * 8) Nettoyage indispensable
      * ---------------------------------------------------------------------- */
     pbuf_free(p);   // Libération du buffer LwIP
-    udp_remove(pcb); // Fermeture du socket UDP (one-shot request)
+    if (pcb != NULL) {
+            udp_remove(pcb);
+            ntp_pcb = NULL; // On signale au système que le PCB est libéré
+        }
 }
 
+
+void build_iso8601_timestamp(char *buf, size_t len)
+{
+    RTC_DateTime dt;
+    RTC_GetDateTime(&dt);
+
+    snprintf(buf, len,
+        "20%02d-%02d-%02dT%02d:%02d:%02dZ",
+        dt.year, dt.month, dt.day,
+        dt.hour, dt.min, dt.sec);
+}
 
 /* -------------------------------------------------------------------------- */
 /*                   ENVOI D’UNE REQUÊTE NTP (Client UDP)                    */
@@ -1822,99 +2033,124 @@ void ntp_recv_callback(void *arg,
   *   ✔ Envoi vers serveur NTP (port 123)
   *   ✔ Le PCB reste ouvert jusqu’à la réception → fermeture dans callback
   */
+/* -------------------------------------------------------------------------- */
+/* ENVOI D’UNE REQUÊTE NTP (Client UDP)                    */
+/* -------------------------------------------------------------------------- */
 void Sync_Time_NTP(void)
 {
-    struct udp_pcb *pcb;
     struct pbuf *p;
     ip_addr_t dest_ip;
     err_t err;
 
-    /* Message de debug via UART */
-    HAL_UART_Transmit(&huart3,
-                      (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n",
-                      44,
-                      100);
+    /* 1. NETTOYAGE PRÉVENTIF : Si un ancien PCB traîne (requête précédente échouée), on le supprime */
+    if (ntp_pcb != NULL) {
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
+    }
 
-    /* ----------------------------------------------------------------------
-     * 1) Création du PCB UDP
-     * ---------------------------------------------------------------------- */
-    pcb = udp_new();
-    if (!pcb)
+    HAL_UART_Transmit(&huart3, (uint8_t*)"🌍 NTP: Connexion au serveur de temps...\r\n", 44, 100);
+
+    /* 2. Création du nouveau PCB UDP */
+    ntp_pcb = udp_new();
+    if (!ntp_pcb) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur alloc PCB (Memoire pleine)\r\n", 44, 100);
         return;
+    }
 
-    /* ----------------------------------------------------------------------
-     * 2) Configuration de la callback de réception
-     *    → C’est ntp_recv_callback() qui traitera la réponse du serveur.
-     * ---------------------------------------------------------------------- */
-    udp_recv(pcb, ntp_recv_callback, NULL);
+    /* 3. Configuration de la callback */
+    udp_recv(ntp_pcb, ntp_recv_callback, NULL);
 
-    /* ----------------------------------------------------------------------
-     * 3) Préparation de l’adresse IP du serveur NTP
-     * ---------------------------------------------------------------------- */
-    ipaddr_aton(NTP_SERVER_IP, &dest_ip);
+    /* 4. Adresse IP (Remise à l'IP Google qui marchait bien chez vous) */
+    // Cloudflare: "162.159.200.1" / Google: "216.239.35.0"
+    ipaddr_aton("216.239.35.0", &dest_ip);
 
-    /* ----------------------------------------------------------------------
-     * 4) Création du paquet NTP (48 octets, mode client)
-     * ---------------------------------------------------------------------- */
+    /* 5. Préparation du buffer NTP */
     uint8_t *buff = (uint8_t *)mem_malloc(NTP_MSG_LEN);
-    if (!buff)
-    {
-        udp_remove(pcb);
+    if (!buff) {
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
         return;
     }
-
     memset(buff, 0, NTP_MSG_LEN);
-    buff[0] = 0x1B;
-    /*
-        LI = 0 (pas d’avertissement)
-        VN = 3 (version du protocole NTP)
-        Mode = 3 (client)
-    */
+    buff[0] = 0x1B; // Mode Client
 
-    /* LwIP : création d’un pbuf transport (UDP = transport layer) */
     p = pbuf_alloc(PBUF_TRANSPORT, NTP_MSG_LEN, PBUF_RAM);
-    if (!p)
-    {
+    if (!p) {
         mem_free(buff);
-        udp_remove(pcb);
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
         return;
     }
-
     memcpy(p->payload, buff, NTP_MSG_LEN);
-    mem_free(buff);   // Le buffer n’est plus nécessaire après copie
+    mem_free(buff);
 
-
-    /* ----------------------------------------------------------------------
-     * 5) Envoi de la requête NTP au serveur (UDP port 123)
-     * ---------------------------------------------------------------------- */
-    err = udp_sendto(pcb, p, &dest_ip, NTP_PORT);
-
-    /* Le pbuf doit être libéré après envoi */
+    /* 6. Envoi */
+    err = udp_sendto(ntp_pcb, p, &dest_ip, NTP_PORT);
     pbuf_free(p);
 
-    if (err == ERR_OK)
-    {
-        /* ⚠️ On NE ferme PAS le PCB ici !
-           → ntp_recv_callback() fermera udp_remove(pcb)
-           après traitement de la réponse. */
-
-        HAL_UART_Transmit(&huart3,
-                          (uint8_t*)"✅ NTP: Requete envoyee, attente...\r\n",
-                          38,
-                          100);
-    }
-    else
-    {
-        HAL_UART_Transmit(&huart3,
-                          (uint8_t*)"❌ NTP: Erreur envoi.\r\n",
-                          22,
-                          100);
-
-        /* En cas d’erreur, il faut libérer le PCB immédiatement */
-        udp_remove(pcb);
+    if (err == ERR_OK) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"✅ NTP: Requete envoyee...\r\n", 29, 100);
+    } else {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ NTP: Erreur envoi.\r\n", 22, 100);
+        // En cas d'erreur immédiate, on libère tout de suite
+        udp_remove(ntp_pcb);
+        ntp_pcb = NULL;
     }
 }
 
+static struct udp_pcb *presence_rx_pcb = NULL;
+static uint32_t last_presence_print_ms = 0;   // anti-spam
+
+void presence_listener_init(void)
+{
+    presence_rx_pcb = udp_new();
+    if (!presence_rx_pcb) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ UDP RX PCB alloc failed\r\n", 28, 100);
+        return;
+    }
+
+    // On écoute sur PRESENCE_PORT sur toutes les IP
+    if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) != ERR_OK) {
+        HAL_UART_Transmit(&huart3, (uint8_t*)"❌ udp_bind presence failed\r\n", 28, 100);
+        udp_remove(presence_rx_pcb);
+        presence_rx_pcb = NULL;
+        return;
+    }
+
+    udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
+    HAL_UART_Transmit(&huart3, (uint8_t*)"✅ UDP presence listener ON\r\n", 28, 100);
+}
+
+void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                      const ip_addr_t *addr, u16_t port)
+{
+    if (!p) return;
+
+    // Copie sûre du payload
+    char buf[300];
+    uint16_t n = (p->tot_len < sizeof(buf) - 1) ? p->tot_len : (sizeof(buf) - 1);
+    pbuf_copy_partial(p, buf, n, 0);
+    buf[n] = '\0';
+
+    // Filtre: on log seulement si ça ressemble à une presence
+    if (strstr(buf, "\"type\"") && strstr(buf, "presence"))
+    {
+        // anti-spam: max 1 log / 300 ms
+        uint32_t now = HAL_GetTick();
+        if (now - last_presence_print_ms > 300)
+        {
+            last_presence_print_ms = now;
+
+            char msg[420];
+            int len = snprintf(msg, sizeof(msg),
+                               "📡 UDP PRESENCE RX from %s:%u => %s\r\n",
+                               ipaddr_ntoa(addr), port, buf);
+            HAL_UART_Transmit(&huart3, (uint8_t*)msg, len, 100);
+        }
+    }
+
+    pbuf_free(p);
+}
 
 
 /* USER CODE END 4 */
@@ -1948,6 +2184,8 @@ void StartDefaultTask(void const * argument)
     sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
     HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
 
+    presence_listener_init(); //udp recive
+
     // 2. NTP
     int retry_count = 0;
     while (ntp_synced == 0) {
@@ -1973,16 +2211,50 @@ void StartDefaultTask(void const * argument)
             system_running = 1;
             HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n>>> SYSTEM STARTED <<<\r\n", 26, 100);
 
-            uint8_t h, m, s; RTC_GetTime(&h, &m, &s);
-            sprintf(msg, "🕒 Heure systeme : %02d:%02d:%02d\r\n", h, m, s);
+            RTC_DateTime dt;
+            RTC_GetDateTime(&dt);
+            snprintf(msg, sizeof(msg),
+                     "🕒 Heure systeme : %02d:%02d:%02d\r\n",
+                     dt.hour, dt.min, dt.sec);
             HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+
+
 
             // Lecture FRAM
             SeismicEvent last;
             memset(&last, 0, sizeof(SeismicEvent));
-            FRAM_Read(FRAM_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
+            FRAM_Read(FRAM_LOCAL_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
+
+
+
+            NeighborEvent nevt;
+            for (int i = 0; i < 3; i++)
+            {
+                uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR +
+                                (i * FRAM_NEIGHBOR_STRIDE);
+
+                FRAM_Read(addr, (uint8_t*)&nevt, sizeof(nevt));
+
+                if (nevt.intensity > 0.1f && nevt.hour < 24)
+                {
+                    sprintf(msg,
+                      "💾 VOISIN %d (FRAM) : 20%02d-%02d-%02d %02d:%02d:%02d (%.0f)\r\n",
+                      nevt.neighbor_id,
+                      nevt.year, nevt.month, nevt.day,
+                      nevt.hour, nevt.min, nevt.sec,
+                      nevt.intensity);
+
+                    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), 100);
+                }
+            }
+
             if(last.intensity > 1.0f && last.intensity < 20000.0f && last.hour < 24) {
-                sprintf(msg, "💾 DERNIER SEISME (FRAM) : %02d:%02d:%02d (Force: %.0f)\r\n", last.hour, last.min, last.sec, last.intensity);
+            	sprintf(msg,
+            	 "💾 DERNIER SEISME (FRAM) : 20%02d-%02d-%02d %02d:%02d:%02d (Force: %.0f)\r\n",
+            	 last.year, last.month, last.day,
+            	 last.hour, last.min, last.sec,
+            	 last.intensity);
+
             } else {
                 sprintf(msg, "💾 Pas de seisme valide en memoire FRAM.\r\n");
             }
@@ -2101,8 +2373,11 @@ void StartClientTask(void const * argument)
         "192.168.129.59"
     };*/
 
-    const char *node_list[] = {"192.168.129.59"};
-    const uint8_t node_count = 1;
+    const char *node_list[] = {
+    		"192.168.129.177",
+			"192.168.129.190",
+    		"192.168.129.27"};
+    const uint8_t node_count = 3;
 
     /*const uint8_t node_count = 4;*/ /* changer absolument quand je rajoute une ip*/
 
@@ -2114,7 +2389,7 @@ void StartClientTask(void const * argument)
     	    send_data_request_tcp(node_list[i]);
     	    osDelay(200); // Petite pause pour ne pas saturer
     	}
-        osDelay(2000); // Pause longue (10s) avant le prochain cycle
+        osDelay(20000); // Pause longue (10s) avant le prochain cycle
     }
   /* USER CODE END StartClientTask */
 }
