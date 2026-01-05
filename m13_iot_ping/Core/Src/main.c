@@ -1630,13 +1630,23 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         sscanf(ptr, "\"acceleration\": {\"x\": %f, \"y\": %f, \"z\": %f}", &rx_x, &rx_y, &rx_z);
     }
 
-    // Max RMS voisin
-    float neighbor_max_rms = rx_x;
-    if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
-    if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
 
-    // Stockage RAM
-    neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+    // Max RMS voisin
+    // Max RMS voisin
+        float neighbor_max_rms = rx_x;
+        if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
+        if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
+
+        /* 🔥 AJOUT ICI : LE CONVERTISSEUR UNIVERSEL 🔥 */
+        // Si on reçoit une valeur < 100 (ex: 1.50), c'est des Volts.
+        // On la convertit en valeur ADC (0-4095) pour que ce soit cohérent avec les autres.
+        if (neighbor_max_rms < 100.0f && neighbor_max_rms > 0.001f) {
+            neighbor_max_rms = (neighbor_max_rms * 4095.0f) / 3.3f;
+        }
+
+        // Stockage RAM (Maintenant tout le monde parle le même langage !)
+        neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+
     uint8_t neighbor_id = neighbor_idx % 3;
     neighbor_idx = (neighbor_idx + 1) % 10;
 
