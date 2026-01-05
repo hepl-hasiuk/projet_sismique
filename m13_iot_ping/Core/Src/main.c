@@ -84,11 +84,25 @@ osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
 
+/* -------------------------------------------------------------------------- */
+/* GESTION DYNAMIQUE DES VOISINS                            */
+/* -------------------------------------------------------------------------- */
+#define MAX_NEIGHBORS 10
+
+typedef struct {
+    ip_addr_t ip;           // L'adresse IP (format LwIP)
+    uint32_t last_seen;     // Timestamp (tick) pour savoir si le noeud est vivant
+    uint8_t active;         // 1 = présent, 0 = vide
+} NeighborNode;
+
+NeighborNode dynamic_node_list[MAX_NEIGHBORS];
+osMutexId nodeMutexHandle; // Pour protéger la liste (UDP écrit, TCP lit)
+
 static struct udp_pcb *presence_tx_pcb = NULL; //udp listener
 static struct udp_pcb *presence_rx_pcb = NULL; // UDP RX listener
 
 
-#define UART_QUEUE_LEN 32
+#define UART_QUEUE_LEN 64
 
 static UartMsg uartMsgPool[UART_QUEUE_LEN];
 static uint8_t uartMsgPoolIndex = 0;
@@ -440,7 +454,9 @@ int main(void)
   osMutexDef(rtcMutex);
   rtcMutexHandle = osMutexCreate(osMutex(rtcMutex)); // 💡 A RAJOUTER
 
-
+  // Dans le main, avec les autres mutex :
+  osMutexDef(nodeMutex);
+  nodeMutexHandle = osMutexCreate(osMutex(nodeMutex));
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -458,11 +474,12 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
+
   /* USER CODE END RTOS_TIMERS */
 
   /* Create the queue(s) */
   /* definition and creation of messageQueue */
-  osMessageQDef(messageQueue, 16, uint32_t);
+  osMessageQDef(messageQueue, 64, uint32_t);
   messageQueueHandle = osMessageCreate(osMessageQ(messageQueue), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
@@ -1191,46 +1208,30 @@ void StartSeismicTask(void const * argument)
     char msg[100];
 
     /* Boucle principale temps réel */
+#define ADC_THRESHOLD_VOLTAGE  2500 //2171 1.75 2482 pour 2
+
     for (;;)
     {
-        /* -------------------------------------------------------------- */
-        /*       1️⃣ Attente nouvelle conversion ADC (DMA + Sémaphore)      */
-        /* -------------------------------------------------------------- */
+        /* 1️⃣ Attente ADC */
         osSemaphoreWait(adcReadySemHandle, osWaitForever);
 
-        /* -------------------------------------------------------------- */
-        /*               2️⃣ Acquisition des valeurs brutes ADC            */
-        /* -------------------------------------------------------------- */
+        /* 2️⃣ Acquisition des valeurs brutes */
         float raw_x = adc_raw[0];
         float raw_y = adc_raw[1];
         float raw_z = adc_raw[2];
 
-        /* Mise à jour buffers circulaires */
+        /* Mise à jour buffers pour RMS */
         buf_x[buffer_idx] = raw_x;
         buf_y[buffer_idx] = raw_y;
         buf_z[buffer_idx] = raw_z;
 
-        /* -------------------------------------------------------------- */
-        /*                   3️⃣ Calcul Moyenne + RMS                       */
-        /* -------------------------------------------------------------- */
-
+        /* 3️⃣ Calcul Moyenne + RMS (ON LE GARDE pour la FRAM et les voisins !) */
         float mean_x = 0, mean_y = 0, mean_z = 0;
-
-        for (int i = 0; i < WINDOW_SIZE; i++)
-        {
-            mean_x += buf_x[i];
-            mean_y += buf_y[i];
-            mean_z += buf_z[i];
-        }
-
-        mean_x /= WINDOW_SIZE;
-        mean_y /= WINDOW_SIZE;
-        mean_z /= WINDOW_SIZE;
+        for (int i = 0; i < WINDOW_SIZE; i++) { mean_x += buf_x[i]; mean_y += buf_y[i]; mean_z += buf_z[i]; }
+        mean_x /= WINDOW_SIZE; mean_y /= WINDOW_SIZE; mean_z /= WINDOW_SIZE;
 
         float var_x = 0, var_y = 0, var_z = 0;
-
-        for (int i = 0; i < WINDOW_SIZE; i++)
-        {
+        for (int i = 0; i < WINDOW_SIZE; i++) {
             var_x += powf(buf_x[i] - mean_x, 2);
             var_y += powf(buf_y[i] - mean_y, 2);
             var_z += powf(buf_z[i] - mean_z, 2);
@@ -1240,105 +1241,94 @@ void StartSeismicTask(void const * argument)
         float calc_rms_y = sqrtf(var_y / WINDOW_SIZE);
         float calc_rms_z = sqrtf(var_z / WINDOW_SIZE);
 
-        /* Mise à jour des valeurs globales protégée par mutex */
+        /* Mise à jour globale */
         osMutexWait(dataMutexHandle, osWaitForever);
-        rms_x = calc_rms_x;
-        rms_y = calc_rms_y;
-        rms_z = calc_rms_z;
+        rms_x = calc_rms_x; rms_y = calc_rms_y; rms_z = calc_rms_z;
         osMutexRelease(dataMutexHandle);
 
         /* -------------------------------------------------------------- */
-        /*                     4️⃣ Détection locale                         */
+        /* 4️⃣ DÉTECTION BASÉE SUR LA TENSION (MODIFIÉ ICI)          */
         /* -------------------------------------------------------------- */
-        if (calc_rms_x > SEISMIC_THRESHOLD ||
-            calc_rms_y > SEISMIC_THRESHOLD ||
-            calc_rms_z > SEISMIC_THRESHOLD)
+
+        // On vérifie si la valeur BRUTE dépasse 1.75V (2171) sur n'importe quel axe
+        // (Note: au repos un accéléromètre est souvent à 1.65V, donc 1.75V est un seuil assez fin)
+
+        if (raw_x > ADC_THRESHOLD_VOLTAGE ||
+            raw_y > ADC_THRESHOLD_VOLTAGE ||
+            raw_z > ADC_THRESHOLD_VOLTAGE)
         {
-            my_alert_status = 1;  // Le nœud local détecte une secousse
+            my_alert_status = 1;
             last_tremor_time = HAL_GetTick();
 
-            /* --- Log UART toutes les 500 ms --- */
+            // Log UART (On affiche la tension max détectée pour info)
             if (HAL_GetTick() - last_print_time > 500)
             {
-                float max_val = calc_rms_x;
-                if (calc_rms_y > max_val) max_val = calc_rms_y;
-                if (calc_rms_z > max_val) max_val = calc_rms_z;
+                // Conversion inverse pour affichage en Volts
+                float vol_x = (raw_x * 3.3f) / 4095.0f;
+                float vol_y = (raw_y * 3.3f) / 4095.0f;
+                float vol_z = (raw_z * 3.3f) / 4095.0f;
+
+                float max_vol = vol_x;
+                if(vol_y > max_vol) max_vol = vol_y;
+                if(vol_z > max_vol) max_vol = vol_z;
 
                 RTC_DateTime dt;
                 RTC_GetDateTime(&dt);
 
                 sprintf(msg,
-                    "[20%02d-%02d-%02d %02d:%02d:%02d] ⚠️ TREMBLEMENT LOCAL — RMS max: %.2f\r\n",
-                    dt.year, dt.month, dt.day,
-                    dt.hour, dt.min, dt.sec,
-                    max_val);
-
+                    "[20%02d-%02d-%02d %02d:%02d:%02d] ⚠️ Alerte SEISME > 2.1V (Max: %.2f V)\r\n",
+                    dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec, max_vol);
 
                 UART_Log("%s", msg);
-
                 last_print_time = HAL_GetTick();
             }
 
             /* ---------------------------------------------------------- */
-            /*         5️⃣ Stockage FRAM (Boîte noire) toutes les 2 s      */
+            /* 5️⃣ Stockage FRAM (On garde le RMS comme demandé)        */
             /* ---------------------------------------------------------- */
             if (HAL_GetTick() - last_save_time > 2000)
             {
-                float max_val = calc_rms_x;
-                if (calc_rms_y > max_val) max_val = calc_rms_y;
-                if (calc_rms_z > max_val) max_val = calc_rms_z;
+                // On stocke toujours le RMS max dans la FRAM (plus représentatif de l'intensité)
+                float max_rms = calc_rms_x;
+                if (calc_rms_y > max_rms) max_rms = calc_rms_y;
+                if (calc_rms_z > max_rms) max_rms = calc_rms_z;
 
-                /* 6️⃣ Stockage en RAM des 10 derniers maxima locaux */
-                local_peaks[local_idx] = max_val;
+                local_peaks[local_idx] = max_rms;
                 local_idx = (local_idx + 1) % 10;
 
-                /* Horodatage RTC */
                 RTC_DateTime dt;
                 RTC_GetDateTime(&dt);
 
                 SeismicEvent evt = {
-                    dt.year,
-                    dt.month,
-                    dt.day,
-                    dt.hour,
-                    dt.min,
-                    dt.sec,
-                    max_val
+                    dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec,
+                    max_rms // <-- On sauvegarde bien le RMS
                 };
 
                 FRAM_Write(FRAM_LOCAL_EVENT_ADDR, (uint8_t*)&evt, sizeof(evt));
-
-
                 HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
                 last_save_time = HAL_GetTick();
             }
         }
         else
         {
-            /* Extinction de l'alerte après 3 secondes sans tremblement */
+            // Extinction alerte après 3s
             if (HAL_GetTick() - last_tremor_time > 3000)
             {
                 if (my_alert_status == 1)
                 {
                     my_alert_status = 0;
                     HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-
                     UART_Log("✅ Fin de l'alerte locale.\r\n");
-
                 }
             }
         }
 
-        /* -------------------------------------------------------------- */
-        /*                    7️⃣ Détection Collective                     */
-        /* -------------------------------------------------------------- */
+        // 7. Alerte Collective
         if (my_alert_status == 1 && neighbor_alert_status == 1)
         {
-            /* ALERTES CONFIRMÉES PAR VOISIN → CLIGNOTEMENT */
             HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
         }
 
-        /* Mise à jour de l’index circulaire */
         buffer_idx = (buffer_idx + 1) % WINDOW_SIZE;
     }
 }
@@ -1631,7 +1621,7 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
 
     // 3. Parsing du Status
     //int is_alert = (strstr(buffer, "\"status\": \"alert\"") != NULL);
-    int is_alert;
+    int is_alert=0;
     if(strstr(buffer, "alert"))is_alert=1;
     // 4. Parsing Accélération
     float rx_x = 0, rx_y = 0, rx_z = 0;
@@ -2170,23 +2160,52 @@ void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 {
     if (!p) return;
 
+    // 1. Lire le message pour vérifier que c'est bien "presence"
     char buf[300];
-    uint16_t len = p->tot_len;
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-
+    uint16_t len = (p->tot_len < sizeof(buf) - 1) ? p->tot_len : sizeof(buf) - 1;
     pbuf_copy_partial(p, buf, len, 0);
     buf[len] = '\0';
 
-    /* 🔥 LOG TOUJOURS LE PAYLOAD (COMME TON AMI) */
-    UART_Log("\r\n======> UDP RX from %s:%u <======\r\n%s\r\n",
-             ipaddr_ntoa(addr), port, buf);
-
-    /* Filtrage SIMPLE */
-    if (strstr(buf, "presence"))
+    // On vérifie si c'est bien un paquet de présence
+    if (strstr(buf, "\"presence\"") != NULL)
     {
-        UART_Log("➡️ Presence detectee\r\n");
-    }
+        // 🔒 Protection mémoire
+        osMutexWait(nodeMutexHandle, osWaitForever);
 
+        int found = 0;
+        int empty_idx = -1;
+
+        // A. Est-ce qu'on connait déjà ce voisin ?
+        for (int i = 0; i < MAX_NEIGHBORS; i++)
+        {
+            if (dynamic_node_list[i].active)
+            {
+                // Compare l'IP reçue avec celle en mémoire
+                if (ip_addr_cmp(&dynamic_node_list[i].ip, addr))
+                {
+                    dynamic_node_list[i].last_seen = HAL_GetTick(); // Mise à jour
+                    found = 1;
+                    break;
+                }
+            }
+            else if (empty_idx == -1)
+            {
+                empty_idx = i; // On repère une case vide au cas où
+            }
+        }
+
+        // B. Nouveau voisin ! On l'ajoute.
+        if (!found && empty_idx != -1)
+        {
+            ip_addr_copy(dynamic_node_list[empty_idx].ip, *addr);
+            dynamic_node_list[empty_idx].last_seen = HAL_GetTick();
+            dynamic_node_list[empty_idx].active = 1;
+
+            UART_Log("🆕 NOUVEAU VOISIN AJOUTE : %s\r\n", ipaddr_ntoa(addr));
+        }
+
+        osMutexRelease(nodeMutexHandle);
+    }
 
     pbuf_free(p);
 }
@@ -2466,36 +2485,58 @@ void StartClientTask(void const * argument)
   /* USER CODE BEGIN StartClientTask */
   /* Infinite loop */
     /* attendre init réseau */
-    extern struct netif gnetif;
-    while (!netif_is_up(&gnetif))
-        osDelay(100);
+	extern struct netif gnetif;
+	    while (!netif_is_up(&gnetif)) osDelay(100);
 
-    // Liste des voisins à interroger
-    /*const char *node_list[] = {
-        "192.168.1.180",
-		"192.168.1.177",
-        "192.168.1.185",
-        "192.168.129.59"
-    };*/
+	    UART_Log("🔍 CLIENT DYNAMIQUE DEMARRE (Attente decouverte...)\r\n");
 
-    const char *node_list[] = {
-    		"192.168.1.177",
-			"192.168.1.190",
-    		"192.168.1.226"};
-    const uint8_t node_count = 3;
+	    for (;;)
+	    {
+	        // 1. On copie la liste localement pour ne pas bloquer le Mutex trop longtemps
+	        ip_addr_t targets[MAX_NEIGHBORS];
+	        int target_count = 0;
 
-    /*const uint8_t node_count = 4;*/ /* changer absolument quand je rajoute une ip*/
+	        osMutexWait(nodeMutexHandle, osWaitForever);
 
-    for(;;)
-    {
-        // 💡 Boucle pour contacter chaque nœud de la liste
-    	for (int i = 0; i < node_count; i++)
-    	{
-    	    send_data_request_tcp(node_list[i]);
-    	    osDelay(200); // Petite pause pour ne pas saturer
-    	}
-        osDelay(20000); // Pause longue (10s) avant le prochain cycle
-    }
+	        for (int i = 0; i < MAX_NEIGHBORS; i++)
+	        {
+	            if (dynamic_node_list[i].active)
+	            {
+	                // Optionnel : Supprimer les vieux noeuds (> 60 secondes sans news)
+	                if (HAL_GetTick() - dynamic_node_list[i].last_seen > 60000) {
+	                    dynamic_node_list[i].active = 0;
+	                    UART_Log("🗑️ Noeud %s supprime (inactif)\r\n", ipaddr_ntoa(&dynamic_node_list[i].ip));
+	                }
+	                else {
+	                    // On copie l'IP pour la traiter
+	                    ip_addr_copy(targets[target_count], dynamic_node_list[i].ip);
+	                    target_count++;
+	                }
+	            }
+	        }
+
+	        osMutexRelease(nodeMutexHandle);
+
+	        // 2. On interroge les cibles trouvées
+	        if (target_count == 0) {
+	            // UART_Log("... Recherche de voisins ...\r\n");
+	        }
+
+	        for (int i = 0; i < target_count; i++)
+	        {
+	            // Conversion IP LwIP vers String pour ta fonction existante
+	            char ip_str[16];
+	            strcpy(ip_str, ipaddr_ntoa(&targets[i]));
+
+	            // On ne s'appelle pas soi-même (optionnel, mais propre)
+	            if (!ip_addr_cmp(&targets[i], &gnetif.ip_addr)) {
+	                send_data_request_tcp(ip_str);
+	                osDelay(200);
+	            }
+	        }
+
+	        osDelay(5000); // On recommence le tour toutes les 5 secondes
+	    }
   /* USER CODE END StartClientTask */
 }
 
