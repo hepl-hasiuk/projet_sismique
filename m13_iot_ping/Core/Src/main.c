@@ -17,7 +17,7 @@
   */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
-#include "main.h"//123
+#include "main.h"
 #include "cmsis_os.h"
 #include "lwip.h"
 
@@ -51,6 +51,9 @@ typedef struct {
 #define PRESENCE_PORT 12345 // Port utilisé pour le protocole de présence (broadcast UDP)
 #define WINDOW_SIZE 100     // Taille de la fenêtre pour le calcul du RMS (100 échantillons)
 #define SEISMIC_THRESHOLD 300.0f // Seuil de détection sismique (valeur RMS)
+
+#define NTP_MAX_RETRIES 15
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,8 +81,13 @@ osThreadId clientTaskHandle;
 osThreadId serverTaskHandle;
 osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
-//osMutexId uartMutexHandle;
+osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
+
+static struct udp_pcb *presence_tx_pcb = NULL; //udp listener
+static struct udp_pcb *presence_rx_pcb = NULL; // UDP RX listener
+
+
 #define UART_QUEUE_LEN 32
 
 static UartMsg uartMsgPool[UART_QUEUE_LEN];
@@ -223,6 +231,7 @@ void StartServerTask(void const * argument);
 void StartHeartBeatTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
+void get_broadcast_ip(ip_addr_t *dest);
 void build_iso8601_timestamp(char *buf, size_t len);
 
 typedef struct {
@@ -324,7 +333,7 @@ void ntp_recv_callback(void *arg,
                        u16_t port);
 
 /* --- Réception présence UDP --- */
-void presence_listener_init(void);
+//void presence_listener_init(void);
 void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                       const ip_addr_t *addr, u16_t port);
 
@@ -340,20 +349,35 @@ void UART_Log(const char *fmt, ...);
 void UART_Log(const char *fmt, ...)
 {
     UartMsg *m;
+    // On utilise le Mutex pour protéger l'accès mémoire
+    osMutexWait(uartMutexHandle, osWaitForever);
 
-    taskENTER_CRITICAL();
     m = &uartMsgPool[uartMsgPoolIndex];
     uartMsgPoolIndex = (uartMsgPoolIndex + 1) % UART_QUEUE_LEN;
-    taskEXIT_CRITICAL();
 
     va_list args;
     va_start(args, fmt);
     vsnprintf(m->text, sizeof(m->text), fmt, args);
     va_end(args);
 
-    osMessagePut(messageQueueHandle, (uint32_t)m, 10);
+    osMutexRelease(uartMutexHandle);
+
+    // Timeout à 0 : Si la queue est pleine, on jette le message au lieu de faire planter le CPU
+    osMessagePut(messageQueueHandle, (uint32_t)m, 0);
 }
 
+void get_broadcast_ip(ip_addr_t *dest)
+{
+    extern struct netif gnetif;
+
+    ip4_addr_t ip   = *netif_ip4_addr(&gnetif);
+    ip4_addr_t mask = *netif_ip4_netmask(&gnetif);
+
+    ip4_addr_t bc;
+    bc.addr = (ip.addr & mask.addr) | (~mask.addr);
+
+    ip_addr_copy_from_ip4(*dest, bc);
+}
 
 
 
@@ -406,8 +430,8 @@ int main(void)
 
   /* Create the mutex(es) */
   /* definition and creation of uartMutex */
-  //osMutexDef(uartMutex);
-  //uartMutexHandle = osMutexCreate(osMutex(uartMutex));
+  osMutexDef(uartMutex);
+  uartMutexHandle = osMutexCreate(osMutex(uartMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -438,10 +462,8 @@ int main(void)
 
   /* Create the queue(s) */
   /* definition and creation of messageQueue */
-  osMessageQDef(messageQueue, UART_QUEUE_LEN, uint32_t);
+  osMessageQDef(messageQueue, 16, uint32_t);
   messageQueueHandle = osMessageCreate(osMessageQ(messageQueue), NULL);
-
-
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -457,11 +479,11 @@ int main(void)
   logMessageTaskHandle = osThreadCreate(osThread(logMessageTask), NULL);
 
   /* definition and creation of clientTask */
-  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 1024);
+  osThreadDef(clientTask, StartClientTask, osPriorityBelowNormal, 0, 256);
   clientTaskHandle = osThreadCreate(osThread(clientTask), NULL);
 
   /* definition and creation of serverTask */
-  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 1024);
+  osThreadDef(serverTask, StartServerTask, osPriorityBelowNormal, 0, 256);
   serverTaskHandle = osThreadCreate(osThread(serverTask), NULL);
 
   /* definition and creation of heartBeatTask */
@@ -473,6 +495,7 @@ int main(void)
   // 💡 Tâche Présence : Envoie un message UDP "Je suis là" à tout le monde
   osThreadDef(presenceTask, StartPresenceTask, osPriorityBelowNormal, 0, 512);
   presenceTaskHandle = osThreadCreate(osThread(presenceTask), NULL);
+
   /* add threads, ... */
 
 
@@ -480,6 +503,10 @@ int main(void)
   // 💡 Tâche Sismique : Priorité ÉLEVÉE car calcul critique en temps réel
   osThreadDef(seismicTask, StartSeismicTask, osPriorityAboveNormal, 0, 2048);
   seismicTaskHandle = osThreadCreate(osThread(seismicTask), NULL);
+
+
+  //osThreadDef(presenceRxTask, StartPresenceRxTask, osPriorityBelowNormal, 0, 512);
+  //osThreadCreate(osThread(presenceRxTask), NULL);
 
 
   /*  IMPORTANT : tout suspendre au début */
@@ -976,6 +1003,19 @@ void StartPresenceTask(void const * argument)
         osDelay(100);
     }
 
+    presence_tx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if (!presence_tx_pcb)
+    {
+        UART_Log("❌ presence TX pcb alloc failed\r\n");
+        vTaskDelete(NULL);
+    }
+
+    presence_tx_pcb->so_options |= SOF_BROADCAST;
+    udp_bind(presence_tx_pcb, IP_ADDR_ANY, 0);
+    ip_set_option(presence_tx_pcb, SOF_BROADCAST);
+
+    UART_Log("✅ UDP presence TX ready\r\n");
+
     /* Boucle principale : envoi périodique du broadcast */
     for (;;)
     {
@@ -999,29 +1039,39 @@ void StartPresenceTask(void const * argument)
 
 void send_presence_broadcast(void)
 {
-    struct udp_pcb *pcb;
+	if (!presence_tx_pcb)
+	    return;
+
+    //struct udp_pcb *pcb;
     struct pbuf *p;
     ip_addr_t dest_ip;
 
-    err_t err;
+    //err_t err;
+    //err = udp_sendto(presence_tx_pcb, p, &dest_ip, PRESENCE_PORT);
 
     /* 1. Création du socket UDP */
-    pcb = udp_new();
-    if (!pcb)
+    //pcb = udp_new();
+   /* if (!pcb)
     {
         return;   // Échec allocation PCB
-    }
+    }*/
 
     /* 2. Activation du mode broadcast */
-    pcb->so_options |= SOF_BROADCAST;
+   /* pcb->so_options |= SOF_BROADCAST; */
 
     /* 3. Adresse de broadcast (adaptée à ton réseau actuel) */
    // ipaddr_aton("239.255.0.1", &dest_ip); // multicast
 
-    ipaddr_aton("192.168.129.255", &dest_ip);
+   //ipaddr_aton("192.168.1.255", &dest_ip);
+    get_broadcast_ip(&dest_ip);
+
+    extern struct netif gnetif;
+    //dest_ip.addr = (gnetif.ip_addr.addr & gnetif.netmask.addr) |
+                 //  (~gnetif.netmask.addr);
+
 
     /* Bind : on n’impose ni port source ni IP */
-    udp_bind(pcb, IP_ADDR_ANY, 0);
+    //udp_bind(pcb, IP_ADDR_ANY, 0);
 
     /* ---------------------------------------------------------------------- */
     /*                  Construction du message JSON "presence"               */
@@ -1030,7 +1080,7 @@ void send_presence_broadcast(void)
     char json[256];
 
     // Récupération dynamique de l'adresse IP actuelle via LwIP
-    extern struct netif gnetif;
+    //extern struct netif gnetif;
     char *device_ip = ipaddr_ntoa(&gnetif.ip_addr);
 
     char ts[32];
@@ -1049,7 +1099,7 @@ void send_presence_broadcast(void)
     p = pbuf_alloc(PBUF_TRANSPORT, strlen(json), PBUF_RAM);
     if (!p)
     {
-        udp_remove(pcb);   // Éviter fuite mémoire
+        //udp_remove(pcb);   // Éviter fuite mémoire
         return;
     }
 
@@ -1057,9 +1107,22 @@ void send_presence_broadcast(void)
     memcpy(p->payload, json, strlen(json));
 
     /* 4. Envoi du message UDP en broadcast */
-    err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
-    (void)err;// empêche le warning "unused variable"
-    UART_Log("📤 UDP PRESENCE SENT => %s\r\n", json);
+    //err = udp_sendto(pcb, p, &dest_ip, PRESENCE_PORT);
+    //(void)err;// empêche le warning "unused variable"
+    //UART_Log("📤 UDP PRESENCE SENT => %s\r\n", json);
+
+   // err_t err;
+    //err = udp_sendto(presence_tx_pcb, p, &dest_ip, PRESENCE_PORT);
+    //err_t err = udp_sendto(presence_tx_pcb, p, &dest_ip, PRESENCE_PORT);
+    err_t err = udp_sendto(presence_tx_pcb, p, &dest_ip, PRESENCE_PORT);
+    if (err == ERR_OK)
+    {
+        UART_Log("📤 UDP PRESENCE SENT => %s\r\n", json);
+    }
+    else
+    {
+        UART_Log("❌ UDP PRESENCE SEND ERROR (%d)\r\n", err);
+    }
 
 
     /* ---------------------------------------------------------------------- */
@@ -1067,7 +1130,7 @@ void send_presence_broadcast(void)
     /* ---------------------------------------------------------------------- */
 
     pbuf_free(p);    // Libération buffer
-    udp_remove(pcb); // Fermeture du socket UDP
+   // udp_remove(pcb); // Fermeture du socket UDP
 
     // Pour debug :
     // if (err != ERR_OK) print erreur
@@ -1371,7 +1434,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
     }
 
     // 2. Copie du message reçu dans un buffer
-    char buffer[512];
+    char buffer[256];
     uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
     memcpy(buffer, p->payload, len);
     buffer[len] = '\0';
@@ -1395,7 +1458,7 @@ err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err
 
 
         // 4. Construction de la RÉPONSE (C'est CA que le voisin va recevoir)
-        char response[512];
+        char response[256];
         char ts[32];
         build_iso8601_timestamp(ts, sizeof(ts));
 
@@ -1548,127 +1611,89 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
  * */
 err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-    /* --------------------------- Validation entrée ------------------------- */
-    if (err != ERR_OK || p == NULL)
-    {
+    // 1. Validation
+    if (err != ERR_OK || p == NULL) {
         if (p) pbuf_free(p);
         tcp_close(tpcb);
         return ERR_OK;
     }
 
-    /* ----------------------- Copie locale du message ----------------------- */
-    char buffer[512];
+    // 2. Copie (Buffer réduit à 256 pour éviter le stack overflow)
+    char buffer[256];
     uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
-
     memcpy(buffer, p->payload, len);
     buffer[len] = '\0';
-    char debug_msg[600]; // Buffer un peu plus grand car les JSON peuvent être longs
-        // On affiche ce qu'on a reçu avec un préfixe clair "RX CLIENT"
-        snprintf(debug_msg, sizeof(debug_msg), "\r\n[RX CLIENT] >> %s\r\n", buffer);
-        UART_Log("%s", debug_msg);
 
-    /* Indiquer à LwIP que les données ont été traitées */
     tcp_recved(tpcb, p->tot_len);
 
-    /* ---------------------- Parsing du statut d’alerte --------------------- */
-    int is_alert = (strstr(buffer, "\"status\": \"alert\"") != NULL);
+    // LOG RX pour débugger
+    UART_Log("\r\n[RX CLIENT] >> %s\r\n", buffer);
 
-    /* ---------------------- Extraction des valeurs RMS --------------------- */
+    // 3. Parsing du Status
+    //int is_alert = (strstr(buffer, "\"status\": \"alert\"") != NULL);
+    int is_alert;
+    if(strstr(buffer, "alert"))is_alert=1;
+    // 4. Parsing Accélération
     float rx_x = 0, rx_y = 0, rx_z = 0;
-
     char *ptr = strstr(buffer, "\"acceleration\"");
-    if (ptr)
-    {
-        char *ptr_x = strstr(ptr, "\"x\":");
-        char *ptr_y = strstr(ptr, "\"y\":");
-        char *ptr_z = strstr(ptr, "\"z\":");
-
-        if (ptr_x) sscanf(ptr_x + 4, "%f", &rx_x);
-        if (ptr_y) sscanf(ptr_y + 4, "%f", &rx_y);
-        if (ptr_z) sscanf(ptr_z + 4, "%f", &rx_z);
-
+    if (ptr) {
+        sscanf(ptr, "\"acceleration\": {\"x\": %f, \"y\": %f, \"z\": %f}", &rx_x, &rx_y, &rx_z);
     }
 
-    /* Déterminer le RMS maximum chez le voisin */
+    // Max RMS voisin
     float neighbor_max_rms = rx_x;
     if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
     if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
 
-    /* ----------------------- Stockage RAM (exigence prof) ------------------ */
-    neighbor_peaks[neighbor_idx] = neighbor_max_rms;   // RAM: 10 valeurs
-    uint8_t neighbor_id = neighbor_idx % 3;            // FRAM: 3 voisins
+    // Stockage RAM
+    neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+    uint8_t neighbor_id = neighbor_idx % 3;
     neighbor_idx = (neighbor_idx + 1) % 10;
 
-    uint8_t ny = 0, nmo = 0, nd = 0, nh = 0, nmin = 0, ns = 0;
+    // 5. PARSING DATE ROBUSTE (Correction du bug Timestamp)
+    int ny, nmo, nd, nh, nmin, ns;
 
-
-
-    if (sscanf(buffer,
-        "%*[^0-9]%2hhu-%2hhu-%2hhuT%2hhu:%2hhu:%2hhu",
-        &ny, &nmo, &nd, &nh, &nmin, &ns) != 6)
+    // Ce sscanf accepte les formats avec espaces et années sur 4 chiffres
+    if (sscanf(buffer, "%*[^0-9]%d-%d-%d%*[^0-9]%d:%d:%d",
+               &ny, &nmo, &nd, &nh, &nmin, &ns) != 6)
     {
-    	UART_Log("⚠️ Timestamp voisin invalide → FRAM non ecrite\r\n");
-
+        UART_Log("⚠️ Timestamp invalide (Format inconnu)\r\n");
         goto skip_neighbor_fram;
     }
 
-    NeighborEvent nevt;
+    // Gestion année 2026 vs 26
+    if (ny > 2000) ny -= 2000;
 
+    // Ecriture FRAM
+    NeighborEvent nevt;
     nevt.neighbor_id = neighbor_id;
-  // ou index du node_list
-    nevt.year  = ny;
-    nevt.month = nmo;
-    nevt.day   = nd;
-    nevt.hour  = nh;
-    nevt.min   = nmin;
-    nevt.sec   = ns;
+    nevt.year = (uint8_t)ny; nevt.month = (uint8_t)nmo; nevt.day = (uint8_t)nd;
+    nevt.hour = (uint8_t)nh; nevt.min = (uint8_t)nmin; nevt.sec = (uint8_t)ns;
     nevt.intensity = neighbor_max_rms;
 
-    uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR +
-                    (neighbor_id * FRAM_NEIGHBOR_STRIDE);
-
-
+    uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR + (neighbor_id * FRAM_NEIGHBOR_STRIDE);
     FRAM_Write(addr, (uint8_t*)&nevt, sizeof(nevt));
 
-
-    /* ------------------------- Gestion du statut voisin --------------------- */
-
-
-
     skip_neighbor_fram:
-        /* Si timestamp invalide, on saute juste l’écriture FRAM,
-           mais on garde le reste (status, alerte, etc.) */
 
-        /* ------------------------- Gestion du statut voisin --------------------- */
-        if (is_alert)
-        {
-            neighbor_alert_status = 1;
+    // 6. GESTION ALERTE (C'est ici que la magie opère)
+    if (is_alert) {
+        neighbor_alert_status = 1;
+        char msg[64];
+        sprintf(msg, "⚠️ VOISIN EN ALERTE ! (Force: %.2f)\r\n", neighbor_max_rms);
+        UART_Log("%s", msg);
+    } else {
+        neighbor_alert_status = 0;
+    }
 
-            char msg[60];
-            snprintf(msg, sizeof(msg),
-                     "⚠️ VOISIN EN ALERTE ! (Force: %.0f)\r\n",
-                     neighbor_max_rms);
+    // 7. ALERTE GÉNÉRALE
+    if (my_alert_status && neighbor_alert_status) {
+        UART_Log("\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n");
+        // Tu peux ajouter ici l'allumage d'une LED rouge fixe par exemple
+    }
 
-            UART_Log("%s", msg);
-        }
-        else
-        {
-            neighbor_alert_status = 0;
-        }
-
-        /* ------------------------- ALERTE COLLECTIVE --------------------------- */
-        if (my_alert_status && neighbor_alert_status)
-        {
-        	UART_Log("\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n");
-
-        }
-
-
-
-    /* --------------------------- Nettoyage + fermeture ---------------------- */
     pbuf_free(p);
     tcp_close(tpcb);
-
     return ERR_OK;
 }
 
@@ -2116,12 +2141,13 @@ void Sync_Time_NTP(void)
     }
 }
 
-static struct udp_pcb *presence_rx_pcb = NULL;
-static uint32_t last_presence_print_ms = 0;   // anti-spam
+//static struct udp_pcb *presence_rx_pcb = NULL;
+//static uint32_t last_presence_print_ms = 0;   // anti-spam
 
-void presence_listener_init(void)
+/*void presence_listener_init(void)
 {
-    presence_rx_pcb = udp_new();
+	presence_rx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+
     if (!presence_rx_pcb) {
     	UART_Log("❌ UDP RX PCB alloc failed\r\n");
         return;
@@ -2137,7 +2163,7 @@ void presence_listener_init(void)
 
     udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
     UART_Log("✅ UDP presence listener ON\r\n");
-}
+}*/
 
 void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                       const ip_addr_t *addr, u16_t port)
@@ -2165,6 +2191,34 @@ void presence_recv_cb(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     pbuf_free(p);
 }
 
+/*void StartPresenceRxTask(void const * argument)
+{
+    extern struct netif gnetif;
+
+    while (!netif_is_up(&gnetif)) {
+        osDelay(100);
+    }
+
+    presence_rx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if (!presence_rx_pcb) {
+        UART_Log("❌ UDP RX pcb alloc failed\r\n");
+        vTaskDelete(NULL);
+    }
+
+    if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) != ERR_OK) {
+        UART_Log("❌ udp_bind presence failed\r\n");
+        udp_remove(presence_rx_pcb);
+        vTaskDelete(NULL);
+    }
+
+    udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
+
+    UART_Log("✅ UDP presence RX task running on port %d\r\n", PRESENCE_PORT);
+
+    for (;;) {
+        osDelay(1);   // ⚠️ CRUCIAL : la tâche ne meurt jamais
+    }
+}*/
 
 
 /* USER CODE END 4 */
@@ -2187,10 +2241,22 @@ void StartDefaultTask(void const * argument)
   //mettre à lehure ici
   //RTC_SetTime(17, 21, 24); // On force l'heure à midi pile
 
+  /* Attendre que l'interface réseau soit up */
+  extern struct netif gnetif;
+  while (!netif_is_up(&gnetif) ||
+         ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) {
+      osDelay(100);
+  }
+
+
+  /* --- UDP RX presence : UNE SEULE FOIS --- */
+
+
   // Demande NTP au démarrage (Etape 3)
 
   extern struct netif gnetif;
     char msg[60];
+
 
     // 1. DHCP
     UART_Log("⏳ Attente IP DHCP...\r\n");
@@ -2202,16 +2268,41 @@ void StartDefaultTask(void const * argument)
     //presence_listener_init(); //udp recive
 
     // 2. NTP
+    // 2. NTP (max 15 tentatives)
     int retry_count = 0;
-    while (ntp_synced == 0) {
+
+    while (ntp_synced == 0 && retry_count < NTP_MAX_RETRIES)
+    {
         Sync_Time_NTP();
-        for(int i=0; i<20; i++) { osDelay(100); if(ntp_synced) break; }
-        if(ntp_synced == 0) {
+
+        // Attente max 2 secondes d'une réponse
+        for (int i = 0; i < 20; i++)
+        {
+            osDelay(100);
+            if (ntp_synced) break;
+        }
+
+        if (!ntp_synced)
+        {
             retry_count++;
-            sprintf(msg, "⚠️ Pas de reponse NTP, tentative %d...\r\n", retry_count);
+            snprintf(msg, sizeof(msg),
+                     "⚠️ NTP: aucune réponse (%d/%d)\r\n",
+                     retry_count, NTP_MAX_RETRIES);
             UART_Log("%s", msg);
         }
     }
+    if (ntp_synced)
+    {
+        UART_Log("🕒 Heure synchronisée via NTP.\r\n");
+    }
+    else
+    {
+        UART_Log("❌ NTP indisponible après 15 tentatives.\r\n");
+        UART_Log("⏩ Démarrage avec l'heure RTC existante.\r\n");
+    }
+
+
+
 
     // 3. PRET
     UART_Log("\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n");
@@ -2225,6 +2316,29 @@ void StartDefaultTask(void const * argument)
           if (!system_running) {
             system_running = 1;
             UART_Log("\r\n>>> SYSTEM STARTED <<<\r\n");
+
+            // --- Activation RX UDP presence ---
+            // --- Activation RX UDP presence ---
+                        if (presence_rx_pcb == NULL) {
+                            presence_rx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+
+                            if (!presence_rx_pcb) {
+                                UART_Log("❌ UDP RX alloc failed\r\n");
+                            } else {
+                                /* 🔥 C'est cette ligne qui manquait pour voir le broadcast des autres 🔥 */
+                                ip_set_option(presence_rx_pcb, SOF_BROADCAST);
+
+                                if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) != ERR_OK) {
+                                    UART_Log("❌ UDP RX bind failed\r\n");
+                                    udp_remove(presence_rx_pcb);
+                                    presence_rx_pcb = NULL;
+                                } else {
+                                    udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
+                                    UART_Log("✅ UDP presence RX ACTIVE\r\n");
+                                }
+                            }
+                        }
+
 
             RTC_DateTime dt;
             RTC_GetDateTime(&dt);
@@ -2274,7 +2388,7 @@ void StartDefaultTask(void const * argument)
                 sprintf(msg, "💾 Pas de seisme valide en memoire FRAM.\r\n");
             }
             UART_Log("%s", msg);
-            presence_listener_init();
+            //presence_listener_init();
             osThreadResume(heartBeatTaskHandle);
             osThreadResume(presenceTaskHandle);
             //osThreadResume(logMessageTaskHandle);
@@ -2365,9 +2479,9 @@ void StartClientTask(void const * argument)
     };*/
 
     const char *node_list[] = {
-    		"192.168.129.177",
-			"192.168.129.190",
-    		"192.168.129.7"};
+    		"192.168.1.177",
+			"192.168.1.190",
+    		"192.168.1.226"};
     const uint8_t node_count = 3;
 
     /*const uint8_t node_count = 4;*/ /* changer absolument quand je rajoute une ip*/
