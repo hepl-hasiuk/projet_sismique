@@ -1,3 +1,5 @@
+
+
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
@@ -50,7 +52,7 @@ typedef struct {
 /* USER CODE BEGIN PD */
 #define PRESENCE_PORT 12345 // Port utilisé pour le protocole de présence (broadcast UDP)
 #define WINDOW_SIZE 100     // Taille de la fenêtre pour le calcul du RMS (100 échantillons)
-#define SEISMIC_THRESHOLD 300.0f // Seuil de détection sismique (valeur RMS)
+#define SEISMIC_THRESHOLD 0.24f // Seuil de détection sismique (valeur RMS)
 
 #define NTP_MAX_RETRIES 15
 
@@ -83,7 +85,8 @@ osThreadId heartBeatTaskHandle;
 osMessageQId messageQueueHandle;
 osMutexId uartMutexHandle;
 /* USER CODE BEGIN PV */
-
+//Variable globale pour l'état du système (0 = Pause, 1 = Marche)
+volatile uint8_t system_is_running = 0;
 /* -------------------------------------------------------------------------- */
 /* GESTION DYNAMIQUE DES VOISINS                            */
 /* -------------------------------------------------------------------------- */
@@ -168,8 +171,10 @@ typedef struct {
 
 
 /* --- Événement reçu d’un voisin --- */
+/* --- Événement reçu d’un voisin --- */
 typedef struct {
-    uint8_t neighbor_id;   // index du voisin (0,1,2…)
+    uint8_t neighbor_id;   // index du slot (0,1,2)
+    uint8_t source_ip;     // <--- AJOUT : On stocke la fin de l'IP (ex: 177)
     uint8_t year;
     uint8_t month;
     uint8_t day;
@@ -216,7 +221,7 @@ uint8_t local_idx = 0;
 #define NTP_PORT 123
 #define NTP_MSG_LEN 48
 #define NTP_TIMESTAMP_DELTA 2208988800u   // Conversion NTP → UNIX
-#define TIMEZONE_OFFSET 1                 // UTC+1 (Belgique)
+#define TIMEZONE_OFFSET 1                 // UTC+1
 
 /* État de synchronisation :
  *   0 → RTC pas encore mis à l'heure
@@ -224,8 +229,33 @@ uint8_t local_idx = 0;
  */
 volatile uint8_t ntp_synced = 0;
 
+/* -------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------- */
+/* NOUVELLE GESTION MEMOIRE (HISTORIQUE)                                      */
+/* -------------------------------------------------------------------------- */
+#define HISTORY_DEPTH 10
+#define MAX_TRACKED_NEIGHBORS 5 // On suit jusqu'à 5 voisins distincts
 
+// 1. Structure pour l'historique LOCAL en RAM (Ajout Année/Mois/Jour)
+typedef struct {
+    float max_rms;
+    uint8_t y, mo, d, h, m, s; // Date complète
+} LocalHistoryItem;
 
+LocalHistoryItem local_history[HISTORY_DEPTH];
+uint8_t local_hist_idx = 0;
+
+// 2. Gestion FRAM VOISINS
+// Taille d'un bloc voisin = 10 événements
+#define FRAM_NEIGHBOR_BLOCK_SIZE  (sizeof(NeighborEvent) * HISTORY_DEPTH)
+
+// Index d'écriture pour chaque slot (5 slots maintenant)
+uint8_t neighbor_fram_idx[MAX_TRACKED_NEIGHBORS] = {0};
+
+// MAPPING : Qui est dans quel slot ? (RAM)
+// ip_map[0] = 190 veut dire que le slot FRAM 0 appartient à l'IP finissant par .190
+// 0 = vide (on suppose que personne n'a l'IP .0)
+uint8_t neighbor_ip_map[MAX_TRACKED_NEIGHBORS] = {0};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -1200,15 +1230,19 @@ void StartSeismicTask(void const * argument)
     memset(buf_y, 0, sizeof(buf_y));
     memset(buf_z, 0, sizeof(buf_z));
 
-    int buffer_idx = 0;          // Index dans la fenêtre glissante
+    int buffer_idx = 0;
     uint32_t last_tremor_time = 0;
     uint32_t last_print_time = 0;
     uint32_t last_save_time  = 0;
 
+    // Ajout d'un timer pour ne pas remplir l'historique RAM trop vite
+    uint32_t last_ram_update = 0;
+
     char msg[100];
 
-    /* Boucle principale temps réel */
-#define ADC_THRESHOLD_VOLTAGE  2500 //2171 1.75 2482 pour 2
+    // Seuil de détection (Raw ADC)
+    // 1.75V environ (Moyenne 1.65V + marge)
+    #define ADC_THRESHOLD_VOLTAGE  2500
 
     for (;;)
     {
@@ -1225,11 +1259,14 @@ void StartSeismicTask(void const * argument)
         buf_y[buffer_idx] = raw_y;
         buf_z[buffer_idx] = raw_z;
 
-        /* 3️⃣ Calcul Moyenne + RMS (ON LE GARDE pour la FRAM et les voisins !) */
+        // A. Calcul de la MOYENNE (Mean)
         float mean_x = 0, mean_y = 0, mean_z = 0;
-        for (int i = 0; i < WINDOW_SIZE; i++) { mean_x += buf_x[i]; mean_y += buf_y[i]; mean_z += buf_z[i]; }
+        for (int i = 0; i < WINDOW_SIZE; i++) {
+            mean_x += buf_x[i]; mean_y += buf_y[i]; mean_z += buf_z[i];
+        }
         mean_x /= WINDOW_SIZE; mean_y /= WINDOW_SIZE; mean_z /= WINDOW_SIZE;
 
+        // B. Calcul de la VARIANCE
         float var_x = 0, var_y = 0, var_z = 0;
         for (int i = 0; i < WINDOW_SIZE; i++) {
             var_x += powf(buf_x[i] - mean_x, 2);
@@ -1237,21 +1274,23 @@ void StartSeismicTask(void const * argument)
             var_z += powf(buf_z[i] - mean_z, 2);
         }
 
+        // C. Calcul du RMS Brut converti en Volts
         float calc_rms_x = sqrtf(var_x / WINDOW_SIZE);
         float calc_rms_y = sqrtf(var_y / WINDOW_SIZE);
         float calc_rms_z = sqrtf(var_z / WINDOW_SIZE);
 
-        /* Mise à jour globale */
+        calc_rms_x = (calc_rms_x * 3.3f) / 4095.0f;
+        calc_rms_y = (calc_rms_y * 3.3f) / 4095.0f;
+        calc_rms_z = (calc_rms_z * 3.3f) / 4095.0f;
+
+        /* Mise à jour globale pour le serveur TCP */
         osMutexWait(dataMutexHandle, osWaitForever);
         rms_x = calc_rms_x; rms_y = calc_rms_y; rms_z = calc_rms_z;
         osMutexRelease(dataMutexHandle);
 
         /* -------------------------------------------------------------- */
-        /* 4️⃣ DÉTECTION BASÉE SUR LA TENSION (MODIFIÉ ICI)          */
+        /* 4️⃣ DÉTECTION ET STOCKAGE                                       */
         /* -------------------------------------------------------------- */
-
-        // On vérifie si la valeur BRUTE dépasse 1.75V (2171) sur n'importe quel axe
-        // (Note: au repos un accéléromètre est souvent à 1.65V, donc 1.75V est un seuil assez fin)
 
         if (raw_x > ADC_THRESHOLD_VOLTAGE ||
             raw_y > ADC_THRESHOLD_VOLTAGE ||
@@ -1260,59 +1299,71 @@ void StartSeismicTask(void const * argument)
             my_alert_status = 1;
             last_tremor_time = HAL_GetTick();
 
-            // Log UART (On affiche la tension max détectée pour info)
+            // --- CORRECTION : CALCUL DU MAX IMMÉDIAT ---
+            float max_rms = calc_rms_x;
+            if (calc_rms_y > max_rms) max_rms = calc_rms_y;
+            if (calc_rms_z > max_rms) max_rms = calc_rms_z;
+
+            // --- 1. Stockage en RAM (Historique rapide) ---
+            // On limite à une écriture tous les 200ms pour voir l'évolution
+            // --- 1. Stockage en RAM (Historique complet avec Heure) ---
+            // --- 1. Stockage en RAM (Historique complet avec DATE + HEURE) ---
+                        if (HAL_GetTick() - last_ram_update > 200)
+                        {
+                            RTC_DateTime dt_now;
+                            RTC_GetDateTime(&dt_now);
+
+                            // Enregistrement complet
+                            local_history[local_hist_idx].max_rms = max_rms;
+                            local_history[local_hist_idx].y  = dt_now.year;
+                            local_history[local_hist_idx].mo = dt_now.month;
+                            local_history[local_hist_idx].d  = dt_now.day;
+                            local_history[local_hist_idx].h  = dt_now.hour;
+                            local_history[local_hist_idx].m  = dt_now.min;
+                            local_history[local_hist_idx].s  = dt_now.sec;
+
+                            // Incrément circulaire (0 -> 9 puis retour à 0)
+                            local_hist_idx = (local_hist_idx + 1) % HISTORY_DEPTH;
+
+                            last_ram_update = HAL_GetTick();
+                        }
+
+            // --- 2. Log UART (toutes les 500ms) ---
             if (HAL_GetTick() - last_print_time > 500)
             {
-                // Conversion inverse pour affichage en Volts
+                // Conversion inverse pour affichage debug tension brute
                 float vol_x = (raw_x * 3.3f) / 4095.0f;
-                float vol_y = (raw_y * 3.3f) / 4095.0f;
-                float vol_z = (raw_z * 3.3f) / 4095.0f;
-
-                float max_vol = vol_x;
-                if(vol_y > max_vol) max_vol = vol_y;
-                if(vol_z > max_vol) max_vol = vol_z;
-
                 RTC_DateTime dt;
                 RTC_GetDateTime(&dt);
 
-                sprintf(msg,
-                    "[20%02d-%02d-%02d %02d:%02d:%02d] ⚠️ Alerte SEISME > 2.1V (Max: %.2f V)\r\n",
-                    dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec, max_vol);
-
+                sprintf(msg, "[%02d:%02d:%02d] ⚠️ SEISME ! RMS: %.2fV (Pic Brute: %.2fV)\r\n",
+                        dt.hour, dt.min, dt.sec, max_rms, vol_x);
                 UART_Log("%s", msg);
                 last_print_time = HAL_GetTick();
             }
 
-            /* ---------------------------------------------------------- */
-            /* 5️⃣ Stockage FRAM (On garde le RMS comme demandé)        */
-            /* ---------------------------------------------------------- */
+            // --- 3. Stockage FRAM (Lent : toutes les 2s) ---
             if (HAL_GetTick() - last_save_time > 2000)
             {
-                // On stocke toujours le RMS max dans la FRAM (plus représentatif de l'intensité)
-                float max_rms = calc_rms_x;
-                if (calc_rms_y > max_rms) max_rms = calc_rms_y;
-                if (calc_rms_z > max_rms) max_rms = calc_rms_z;
-
-                local_peaks[local_idx] = max_rms;
-                local_idx = (local_idx + 1) % 10;
-
                 RTC_DateTime dt;
                 RTC_GetDateTime(&dt);
 
                 SeismicEvent evt = {
                     dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec,
-                    max_rms // <-- On sauvegarde bien le RMS
+                    max_rms
                 };
 
                 FRAM_Write(FRAM_LOCAL_EVENT_ADDR, (uint8_t*)&evt, sizeof(evt));
                 HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+
+                UART_Log("💾 Evenement local sauvegarde en FRAM.\r\n");
                 last_save_time = HAL_GetTick();
             }
         }
         else
         {
-            // Extinction alerte après 3s
-            if (HAL_GetTick() - last_tremor_time > 3000)
+            // Extinction alerte après 3s de calme
+            if (HAL_GetTick() - last_tremor_time > 6000)
             {
                 if (my_alert_status == 1)
                 {
@@ -1378,13 +1429,21 @@ void tcp_server_init(void)
 err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 {
     /* En cas d’erreur de connexion, on refuse immédiatement */
-    if (err != ERR_OK || newpcb == NULL)
-    {
-        return ERR_VAL;
-    }
+	//* --- AJOUT : Si le système est en pause, on refuse la connexion --- */
+	    if (system_is_running == 0)
+	    {
+	        return ERR_ABRT; // On rejette poliment la connexion
+	    }
+	    /* ------------------------------------------------------------------ */
 
-    /* ------------------------- LOG DE CONNEXION -------------------------- */
-    UART_Log("📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
+	    /* En cas d’erreur de connexion, on refuse immédiatement */
+	    if (err != ERR_OK || newpcb == NULL)
+	    {
+	        return ERR_VAL;
+	    }
+
+	    /* ------------------------- LOG DE CONNEXION -------------------------- */
+	    UART_Log("📥 Client connecté depuis %s\r\n", ipaddr_ntoa(&newpcb->remote_ip));
 
 
     /* ----------------------------------------------------------------------
@@ -1414,67 +1473,85 @@ err_t tcp_server_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
  * Fonction appelée automatiquement lorsqu’un client envoie
  * des données au serveur TCP.
  */
+/*
+ * Fonction appelée automatiquement lorsqu’un client envoie
+ * des données au serveur TCP.
+ */
+/*
+ * Fonction appelée automatiquement lorsqu’un client envoie
+ * des données au serveur TCP.
+ */
+/*
+ * Fonction appelée automatiquement lorsqu’un client (voisin)
+ * envoie des données à TON serveur TCP.
+ */
+/*
+ * Fonction appelée automatiquement lorsqu’un client (voisin)
+ * envoie des données à TON serveur TCP.
+ */
 err_t tcp_server_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err)
 {
-    // 1. Vérification standard
+    // 1. Vérification standard (Connexion coupée ou erreur)
     if (err != ERR_OK || p == NULL) {
         if (p) pbuf_free(p);
         tcp_close(tpcb);
         return ERR_OK;
     }
 
-    // 2. Copie du message reçu dans un buffer
-    char buffer[256];
-    uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
-    memcpy(buffer, p->payload, len);
-    buffer[len] = '\0';
+    // 2. On "consomme" le paquet reçu (on dit à LwIP qu'on l'a lu)
+    tcp_recved(tpcb, p->tot_len);
 
-    tcp_recved(tpcb, p->tot_len); // On dit à LwIP qu'on a bien reçu
-
-    // --- DEBUG 1 : On affiche ce qui RENTRE (La demande du voisin) ---
-    char debug_msg[600];
-    snprintf(debug_msg, sizeof(debug_msg), "\r\n[1] 📩 QUESTION RECUE du voisin :\r\n%s\r\n", buffer);
-    UART_Log("%s", debug_msg);
-
-    // 3. Est-ce que c'est une demande de données ?
-    if (strstr(buffer, "\"data_request\"") != NULL)
-    {
-        // Récupération des données
-        float tx_x, tx_y, tx_z;
-        osMutexWait(dataMutexHandle, osWaitForever);
-        tx_x = rms_x; tx_y = rms_y; tx_z = rms_z;
-        osMutexRelease(dataMutexHandle);
-
-
-
-        // 4. Construction de la RÉPONSE (C'est CA que le voisin va recevoir)
-        char response[256];
-        char ts[32];
-        build_iso8601_timestamp(ts, sizeof(ts));
-
-        snprintf(response, sizeof(response),
-         "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
-         "\"timestamp\": \"%s\", "
-         "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
-         "\"status\": \"%s\" }",
-         ts, tx_x, tx_y, tx_z,
-         my_alert_status ? "alert" : "normal");
-
-
-        // --- DEBUG 2 : On affiche ce qui SORT (Ta réponse) ---
-        // Vérifie bien que cette ligne s'affiche dans ton terminal !
-        char debug_tx[600];
-        snprintf(debug_tx, sizeof(debug_tx), "[2] 📤 REPONSE ENVOYEE au voisin :\r\n%s\r\n\r\n", response);
-        UART_Log("%s", debug_tx);
-
-
-        // Envoi TCP
-        tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
-        tcp_output(tpcb);
-        tcp_close(tpcb);
-    }
-
+    // On libère le buffer d'entrée immédiatement, on sait que c'est une demande
     pbuf_free(p);
+
+    // 3. Récupération des données locales (RMS actuel)
+    float tx_x, tx_y, tx_z;
+    osMutexWait(dataMutexHandle, osWaitForever);
+    tx_x = rms_x; tx_y = rms_y; tx_z = rms_z;
+    osMutexRelease(dataMutexHandle);
+
+    // 4. Préparation du Timestamp (Format "Ahmed" avec les espaces)
+    RTC_DateTime dt;
+    RTC_GetDateTime(&dt);
+    char ts_str[32];
+    snprintf(ts_str, sizeof(ts_str), "20%02d-%02d-%02d T %02d:%02d:%02d",
+             dt.year, dt.month, dt.day, dt.hour, dt.min, dt.sec);
+
+    // 5. Détermination CLAIRE du statut (Alerte ou Normal)
+    // C'est la ligne la plus importante : elle regarde ta variable globale
+    const char *status_str = (my_alert_status == 1) ? "alert" : "normal";
+
+    // 6. Construction de la RÉPONSE JSON
+    char response[256];
+    snprintf(response, sizeof(response),
+     "{ \"type\": \"data_response\", \"id\": \"nucleo-8\", "
+     "\"timestamp\": \"%s\", "
+     "\"acceleration\": {\"x\": %.2f, \"y\": %.2f, \"z\": %.2f}, "
+     "\"status\": \"%s\" }",
+     ts_str, tx_x, tx_y, tx_z,
+     status_str); // <--- Ici on injecte "alert" ou "normal"
+
+    // =================================================================
+    // 🚨 AFFICHAGE UART : C'est ici que tu vérifies ce que tu envoies
+    // =================================================================
+    UART_Log("\r\n--------------------------------------------------\r\n");
+    UART_Log("[TX REPONSE VERS VOISIN] >> %s\r\n", response);
+
+    if (my_alert_status == 1) {
+        UART_Log("⚠️  ATTENTION : J'ENVOIE LE STATUS 'ALERT' !\r\n");
+    } else {
+        UART_Log("✅  INFO : J'envoie le status 'normal'.\r\n");
+    }
+    UART_Log("--------------------------------------------------\r\n");
+    // =================================================================
+
+    // 7. Envoi TCP (C'est ici que le message part dans le câble)
+    tcp_write(tpcb, response, strlen(response), TCP_WRITE_FLAG_COPY);
+    tcp_output(tpcb); // Force l'envoi immédiat
+
+    // 8. On ferme la connexion car on a répondu
+    tcp_close(tpcb);
+
     return ERR_OK;
 }
 
@@ -1547,6 +1624,7 @@ void send_data_request_tcp(const char *ip)
   *   ✔ Installer la fonction de réception (tcp_client_recv_response)
   *   ✔ Construire et envoyer la requête JSON "data_request"
   **/
+// 💡 Callback appelée quand la connexion client est réussie
 err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
 {
     /* ----------------------------- Vérification ---------------------------- */
@@ -1563,7 +1641,6 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
 
     /* ----------------------------------------------------------------------
      * 2) Construction de la requête JSON conforme aux spécifications
-     *    { "type": "data_request", "from": "...", "to": "...", "timestamp": ... }
      * ---------------------------------------------------------------------- */
     char sendbuf[256];
     char ts[32];
@@ -1574,6 +1651,11 @@ err_t tcp_client_connected(void *arg, struct tcp_pcb *tpcb, err_t err)
      "\"timestamp\": \"%s\" }",
      ipaddr_ntoa(&tpcb->remote_ip), ts);
 
+    // ============================================================
+    // 👇 AJOUT ICI : On affiche ce qu'on envoie sur l'UART 👇
+    // ============================================================
+    UART_Log("[TX CLIENT] << %s\r\n", sendbuf);
+    // ============================================================
 
     /* ----------------------------------------------------------------------
      * 3) Envoi de la requête JSON vers le voisin
@@ -1608,88 +1690,132 @@ err_t tcp_client_recv_response(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, 
         return ERR_OK;
     }
 
-    // 2. Copie (Buffer réduit à 256 pour éviter le stack overflow)
+    // 2. Copie
     char buffer[256];
     uint16_t len = (p->len < sizeof(buffer) - 1) ? p->len : sizeof(buffer) - 1;
     memcpy(buffer, p->payload, len);
     buffer[len] = '\0';
 
     tcp_recved(tpcb, p->tot_len);
-
-    // LOG RX pour débugger
     UART_Log("\r\n[RX CLIENT] >> %s\r\n", buffer);
 
-    // 3. Parsing du Status
-    //int is_alert = (strstr(buffer, "\"status\": \"alert\"") != NULL);
-    int is_alert=0;
-    if(strstr(buffer, "alert"))is_alert=1;
+    // 3. Status
+    int is_alert = 0;
+    if(strstr(buffer, "alert")) is_alert = 1;
+
+    // --- RECUPERATION DE L'IP (QUI NOUS PARLE ?) ---
+    // On prend le dernier octet de l'IP (ex: 192.168.1.177 -> 177)
+    ip4_addr_t *addr_ptr = ip_2_ip4(&tpcb->remote_ip);
+    uint8_t ip_suffix = ip4_addr4(addr_ptr);
+
+    // -----------------------------------------------
+
     // 4. Parsing Accélération
     float rx_x = 0, rx_y = 0, rx_z = 0;
-    char *ptr = strstr(buffer, "\"acceleration\"");
-    if (ptr) {
-        sscanf(ptr, "\"acceleration\": {\"x\": %f, \"y\": %f, \"z\": %f}", &rx_x, &rx_y, &rx_z);
+    char *acc_ptr = strstr(buffer, "\"acceleration\"");
+
+    if (acc_ptr) {
+        char *px = strstr(acc_ptr, "\"x\"");
+        if (px) { while(*px && (*px < '0' || *px > '9') && *px != '-') px++; sscanf(px, "%f", &rx_x); }
+
+        char *py = strstr(acc_ptr, "\"y\"");
+        if (py) { while(*py && (*py < '0' || *py > '9') && *py != '-') py++; sscanf(py, "%f", &rx_y); }
+
+        char *pz = strstr(acc_ptr, "\"z\"");
+        if (pz) { while(*pz && (*pz < '0' || *pz > '9') && *pz != '-') pz++; sscanf(pz, "%f", &rx_z); }
     }
 
+    // Calcul du Max et stockage RAM
+    float neighbor_max_rms = rx_x;
+    if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
+    if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
 
-    // Max RMS voisin
-    // Max RMS voisin
-        float neighbor_max_rms = rx_x;
-        if (rx_y > neighbor_max_rms) neighbor_max_rms = rx_y;
-        if (rx_z > neighbor_max_rms) neighbor_max_rms = rx_z;
+    if (neighbor_max_rms > 100.0f) neighbor_max_rms = (neighbor_max_rms * 3.3f) / 4095.0f;
 
-        /* 🔥 AJOUT ICI : LE CONVERTISSEUR UNIVERSEL 🔥 */
-        // Si on reçoit une valeur < 100 (ex: 1.50), c'est des Volts.
-        // On la convertit en valeur ADC (0-4095) pour que ce soit cohérent avec les autres.
-        if (neighbor_max_rms < 100.0f && neighbor_max_rms > 0.001f) {
-            neighbor_max_rms = (neighbor_max_rms * 4095.0f) / 3.3f;
-        }
-
-        // Stockage RAM (Maintenant tout le monde parle le même langage !)
-        neighbor_peaks[neighbor_idx] = neighbor_max_rms;
-
-    uint8_t neighbor_id = neighbor_idx % 3;
+    neighbor_peaks[neighbor_idx] = neighbor_max_rms;
+   // uint8_t neighbor_id = neighbor_idx % 3;
     neighbor_idx = (neighbor_idx + 1) % 10;
 
-    // 5. PARSING DATE ROBUSTE (Correction du bug Timestamp)
+    // 5. Parsing Date
     int ny, nmo, nd, nh, nmin, ns;
+    char *ts_ptr = strstr(buffer, "\"timestamp\"");
 
-    // Ce sscanf accepte les formats avec espaces et années sur 4 chiffres
-    if (sscanf(buffer, "%*[^0-9]%d-%d-%d%*[^0-9]%d:%d:%d",
-               &ny, &nmo, &nd, &nh, &nmin, &ns) != 6)
-    {
-        UART_Log("⚠️ Timestamp invalide (Format inconnu)\r\n");
+    if (ts_ptr == NULL) {
+        UART_Log("⚠️ Pas de timestamp\r\n");
         goto skip_neighbor_fram;
     }
+    while (*ts_ptr && (*ts_ptr < '0' || *ts_ptr > '9')) ts_ptr++;
 
-    // Gestion année 2026 vs 26
+    if (sscanf(ts_ptr, "%d-%d-%d%*[^0-9]%d:%d:%d", &ny, &nmo, &nd, &nh, &nmin, &ns) != 6) {
+        UART_Log("⚠️ Date invalide\r\n");
+        goto skip_neighbor_fram;
+    }
     if (ny > 2000) ny -= 2000;
 
-    // Ecriture FRAM
-    NeighborEvent nevt;
-    nevt.neighbor_id = neighbor_id;
-    nevt.year = (uint8_t)ny; nevt.month = (uint8_t)nmo; nevt.day = (uint8_t)nd;
-    nevt.hour = (uint8_t)nh; nevt.min = (uint8_t)nmin; nevt.sec = (uint8_t)ns;
-    nevt.intensity = neighbor_max_rms;
+    // --- ECRITURE FRAM (AVEC L'IP MAINTENANT) ---
+    // --- ECRITURE FRAM MULTIPLE (10 valeurs par voisin) ---
+    // --- GESTION INTELLIGENTE DES SLOTS FRAM ---
+        int assigned_slot = -1;
 
-    uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR + (neighbor_id * FRAM_NEIGHBOR_STRIDE);
-    FRAM_Write(addr, (uint8_t*)&nevt, sizeof(nevt));
+        // 1. Est-ce que ce voisin a déjà un slot attitré ?
+        for(int i=0; i<MAX_TRACKED_NEIGHBORS; i++) {
+            if(neighbor_ip_map[i] == ip_suffix) {
+                assigned_slot = i;
+                break;
+            }
+        }
 
-    skip_neighbor_fram:
+        // 2. Si non, on cherche un slot vide
+        if(assigned_slot == -1) {
+            for(int i=0; i<MAX_TRACKED_NEIGHBORS; i++) {
+                if(neighbor_ip_map[i] == 0) { // 0 = Libre
+                    neighbor_ip_map[i] = ip_suffix; // On réserve ce slot
+                    assigned_slot = i;
+                    // On reset l'index d'écriture pour ce nouveau venu
+                    neighbor_fram_idx[i] = 0;
+                    break;
+                }
+            }
+        }
 
-    // 6. GESTION ALERTE (C'est ici que la magie opère)
-    if (is_alert) {
+        // 3. Si on a un slot, on écrit
+        if (assigned_slot != -1) {
+            NeighborEvent nevt;
+            nevt.neighbor_id = assigned_slot;
+            nevt.source_ip   = ip_suffix;
+            nevt.year = (uint8_t)ny; nevt.month = (uint8_t)nmo; nevt.day = (uint8_t)nd;
+            nevt.hour = (uint8_t)nh; nevt.min = (uint8_t)nmin; nevt.sec = (uint8_t)ns;
+            nevt.intensity = neighbor_max_rms;
+
+            // Calcul adresse : Base + (Offset Slot) + (Offset Event interne 0-9)
+            uint32_t base_addr = FRAM_NEIGHBOR_BASE_ADDR + (assigned_slot * FRAM_NEIGHBOR_BLOCK_SIZE);
+            uint8_t current_idx = neighbor_fram_idx[assigned_slot];
+            uint32_t final_addr = base_addr + (current_idx * sizeof(NeighborEvent));
+
+            FRAM_Write(final_addr, (uint8_t*)&nevt, sizeof(nevt));
+
+            // Incrément circulaire pour ce slot
+            neighbor_fram_idx[assigned_slot] = (neighbor_fram_idx[assigned_slot] + 1) % HISTORY_DEPTH;
+
+            UART_Log("💾 Voisin .%d stocké dans Slot %d (Pos %d)\r\n", ip_suffix, assigned_slot, current_idx);
+        }
+        else {
+            UART_Log("⚠️ Plus de place (5 voisins max déjà enregistrés) !\r\n");
+        }
+
+        skip_neighbor_fram:
+            // ↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑↑
+
+            // 6. Alerte
+            if (is_alert) {
         neighbor_alert_status = 1;
-        char msg[64];
-        sprintf(msg, "⚠️ VOISIN EN ALERTE ! (Force: %.2f)\r\n", neighbor_max_rms);
-        UART_Log("%s", msg);
+        UART_Log("⚠️ ALERTE VOISIN (.%d) ! Force: %.2f\r\n", ip_suffix, neighbor_max_rms);
     } else {
         neighbor_alert_status = 0;
     }
 
-    // 7. ALERTE GÉNÉRALE
     if (my_alert_status && neighbor_alert_status) {
-        UART_Log("\r\n🚨🚨🚨 ALERTE GENERALE CONFIRMEE ! 🚨🚨🚨\r\n");
-        // Tu peux ajouter ici l'allumage d'une LED rouge fixe par exemple
+        UART_Log("\r\n🚨🚨🚨 ALERTE GENERALE ! 🚨🚨🚨\r\n");
     }
 
     pbuf_free(p);
@@ -2263,196 +2389,178 @@ void StartDefaultTask(void const * argument)
 {
   /* init code for LWIP */
   MX_LWIP_Init();
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  //uint8_t system_running = 0; // Drapeau d'état système
-  //une fois
-  //mettre à lehure ici
-  //RTC_SetTime(17, 21, 24); // On force l'heure à midi pile
 
-  /* Attendre que l'interface réseau soit up */
   extern struct netif gnetif;
-  while (!netif_is_up(&gnetif) ||
-         ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) {
-      osDelay(100);
+  char msg[128];
+
+  // 1. DHCP
+  UART_Log("⏳ Attente IP DHCP...\r\n");
+  while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) { osDelay(500); }
+  sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
+  UART_Log("%s", msg);
+
+  // 2. NTP (Synchronisation Heure)
+  int retry_count = 0;
+  while (ntp_synced == 0 && retry_count < NTP_MAX_RETRIES)
+  {
+      Sync_Time_NTP();
+      for (int i = 0; i < 20; i++) { osDelay(100); if (ntp_synced) break; }
+      if (!ntp_synced) {
+          retry_count++;
+          UART_Log("⚠️ NTP: essai %d/%d...\r\n", retry_count, NTP_MAX_RETRIES);
+      }
   }
+  if (ntp_synced) UART_Log("🕒 Heure synchronisée NTP.\r\n");
+  else UART_Log("⏩ Démarrage sans NTP (Heure RTC).\r\n");
 
 
-  /* --- UDP RX presence : UNE SEULE FOIS --- */
+  // 3. SYSTEME PRET
+  UART_Log("\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n");
+  system_is_running = 0;
 
 
-  // Demande NTP au démarrage (Etape 3)
+  for(;;) {
+      if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
+        osDelay(50);
+        while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
 
-  extern struct netif gnetif;
-    char msg[60];
+        if (!system_is_running) {
+        	system_is_running = 1;
+          UART_Log("\r\n>>> SYSTEM STARTED <<<\r\n");
 
+          // Activation UDP
+          if (presence_rx_pcb == NULL) {
+              presence_rx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+              if (presence_rx_pcb) {
+                  ip_set_option(presence_rx_pcb, SOF_BROADCAST);
+                  if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) == ERR_OK) {
+                      udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
+                      UART_Log("✅ UDP presence RX ACTIVE\r\n");
+                  }
+              }
+          }
 
-    // 1. DHCP
-    UART_Log("⏳ Attente IP DHCP...\r\n");
+          // =========================================================
+          //  ⚠️⚠️⚠️ ZONE DE NETTOYAGE (A FAIRE 1 FOIS) ⚠️⚠️⚠️
+          // =========================================================
 
-    while (!netif_is_up(&gnetif) || ip4_addr_isany_val(*netif_ip4_addr(&gnetif))) { osDelay(500); }
-    sprintf(msg, "✅ IP Obtenue : %s\r\n", ipaddr_ntoa(&gnetif.ip_addr));
-    UART_Log("%s", msg);
+          int WIPE_FRAM = 0; // <--- METTRE A 1, FLASHER, PUIS REMETTRE A 0
 
-    //presence_listener_init(); //udp recive
+          if (WIPE_FRAM) {
+              UART_Log("\r\n🧹 --- NETTOYAGE COMPLET DE LA FRAM EN COURS... --- 🧹\r\n");
+              uint8_t zeros[sizeof(NeighborEvent)];
+              memset(zeros, 0, sizeof(NeighborEvent));
 
-    // 2. NTP
-    // 2. NTP (max 15 tentatives)
-    int retry_count = 0;
+              // On efface TOUT (Slots Voisins + Local)
+              // 1. Local
+              FRAM_Write(FRAM_LOCAL_EVENT_ADDR, zeros, sizeof(SeismicEvent));
 
-    while (ntp_synced == 0 && retry_count < NTP_MAX_RETRIES)
-    {
-        Sync_Time_NTP();
+              // 2. Voisins (5 slots * 10 valeurs)
+              for(int s=0; s < MAX_TRACKED_NEIGHBORS; s++) {
+                  // On reset la map RAM aussi
+                  neighbor_ip_map[s] = 0;
+                  neighbor_fram_idx[s] = 0;
 
-        // Attente max 2 secondes d'une réponse
-        for (int i = 0; i < 20; i++)
-        {
-            osDelay(100);
-            if (ntp_synced) break;
-        }
-
-        if (!ntp_synced)
-        {
-            retry_count++;
-            snprintf(msg, sizeof(msg),
-                     "⚠️ NTP: aucune réponse (%d/%d)\r\n",
-                     retry_count, NTP_MAX_RETRIES);
-            UART_Log("%s", msg);
-        }
-    }
-    if (ntp_synced)
-    {
-        UART_Log("🕒 Heure synchronisée via NTP.\r\n");
-    }
-    else
-    {
-        UART_Log("❌ NTP indisponible après 15 tentatives.\r\n");
-        UART_Log("⏩ Démarrage avec l'heure RTC existante.\r\n");
-    }
-
-
-
-
-    // 3. PRET
-    UART_Log("\r\n>>> SYSTEME PRET (Appuyez sur BLEU) <<<\r\n");
-    uint8_t system_running = 0;
-
-    for(;;) {
-        if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET) {
-          osDelay(50);
-          while (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_SET);
-
-          if (!system_running) {
-            system_running = 1;
-            UART_Log("\r\n>>> SYSTEM STARTED <<<\r\n");
-
-            // --- Activation RX UDP presence ---
-            // --- Activation RX UDP presence ---
-                        if (presence_rx_pcb == NULL) {
-                            presence_rx_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
-
-                            if (!presence_rx_pcb) {
-                                UART_Log("❌ UDP RX alloc failed\r\n");
-                            } else {
-                                /* 🔥 C'est cette ligne qui manquait pour voir le broadcast des autres 🔥 */
-                                ip_set_option(presence_rx_pcb, SOF_BROADCAST);
-
-                                if (udp_bind(presence_rx_pcb, IP_ADDR_ANY, PRESENCE_PORT) != ERR_OK) {
-                                    UART_Log("❌ UDP RX bind failed\r\n");
-                                    udp_remove(presence_rx_pcb);
-                                    presence_rx_pcb = NULL;
-                                } else {
-                                    udp_recv(presence_rx_pcb, presence_recv_cb, NULL);
-                                    UART_Log("✅ UDP presence RX ACTIVE\r\n");
-                                }
-                            }
-                        }
+                  for(int k=0; k<HISTORY_DEPTH; k++) {
+                      uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR + (s * FRAM_NEIGHBOR_BLOCK_SIZE) + (k * sizeof(NeighborEvent));
+                      FRAM_Write(addr, zeros, sizeof(NeighborEvent));
+                      HAL_Delay(5); // Petite pause sécurité
+                  }
+                  UART_Log("Slot %d effacé...\r\n", s);
+              }
+              UART_Log("✅ FRAM NETTOYEE ! \r\n");
+              UART_Log("⚠️ Changez maintenant 'int WIPE_FRAM = 0;' dans le code et reflashez !\r\n");
+              while(1) { HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); osDelay(100); } // Bloque ici
+          }
+          // =========================================================
 
 
-            RTC_DateTime dt;
-            RTC_GetDateTime(&dt);
-            snprintf(msg, sizeof(msg),
-                     "🕒 Heure systeme : %02d:%02d:%02d\r\n",
-                     dt.hour, dt.min, dt.sec);
-            UART_Log("%s", msg);
+          // LECTURE INITIALE (AU DEMARRAGE)
+          UART_Log("--- 📂 ETAT MEMOIRE FRAM (Demarrage) 📂 --- \r\n");
+          NeighborEvent nevt;
+          int found_nb = 0;
 
+          for (int i = 0; i < MAX_TRACKED_NEIGHBORS; i++)
+          {
+              // On lit le dernier événement écrit (approximatif, on prend le slot 0 du bloc)
+              uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR + (i * FRAM_NEIGHBOR_BLOCK_SIZE);
+              FRAM_Read(addr, (uint8_t*)&nevt, sizeof(nevt));
 
+              if (nevt.source_ip != 0 && nevt.source_ip != 0xFF) {
+                  sprintf(msg, "📡 SLOT %d (IP .%d) | %02d/%02d %02d:%02d | Force: %.2f V\r\n",
+                          i, nevt.source_ip, nevt.day, nevt.month, nevt.hour, nevt.min, nevt.intensity);
+                  UART_Log("%s", msg);
 
-            // Lecture FRAM
-            SeismicEvent last;
-            memset(&last, 0, sizeof(SeismicEvent));
-            FRAM_Read(FRAM_LOCAL_EVENT_ADDR, (uint8_t*)&last, sizeof(SeismicEvent));
+                  // IMPORTANT : On recharge la mémoire RAM pour ne pas écraser ce voisin
+                  neighbor_ip_map[i] = nevt.source_ip;
+                  found_nb++;
+              } else {
+                   neighbor_ip_map[i] = 0; // Slot libre
+              }
+          }
+          if (found_nb == 0) UART_Log("   (Memoire vide)\r\n");
+          UART_Log("-----------------------------------\r\n");
 
+          // Reprise des tâches
+          osThreadResume(heartBeatTaskHandle);
+          osThreadResume(presenceTaskHandle);
+          osThreadResume(seismicTaskHandle);
+          osThreadResume(clientTaskHandle);
 
+        } else {
+            // -----------------------------------------------------------
+            //  MODE PAUSE (STOP)
+            // -----------------------------------------------------------
+        	system_is_running = 0;
+            UART_Log("\r\n>>> SYSTEM STOPPED (PAUSE) <<<\r\n");
 
-            NeighborEvent nevt;
-            for (int i = 0; i < 3; i++)
-            {
-                uint32_t addr = FRAM_NEIGHBOR_BASE_ADDR +
-                                (i * FRAM_NEIGHBOR_STRIDE);
-
-                FRAM_Read(addr, (uint8_t*)&nevt, sizeof(nevt));
-
-                if (nevt.intensity > 0.1f && nevt.hour < 24)
-                {
-                    sprintf(msg,
-                      "💾 VOISIN %d (FRAM) : 20%02d-%02d-%02d %02d:%02d:%02d (%.0f)\r\n",
-                      nevt.neighbor_id,
-                      nevt.year, nevt.month, nevt.day,
-                      nevt.hour, nevt.min, nevt.sec,
-                      nevt.intensity);
-
+            // 1. LOCAL
+            UART_Log("\r\n📊 --- 10 VALEURS LOCALES (RAM) ---\r\n");
+            UART_Log("Idx | Date       Heure    | Intensite\r\n");
+            for(int i=0; i<HISTORY_DEPTH; i++) {
+                LocalHistoryItem *item = &local_history[i];
+                if (item->max_rms > 0.001f) {
+                    sprintf(msg, " %02d | 20%02d-%02d-%02d %02d:%02d:%02d | %.2f V\r\n",
+                            i, item->y, item->mo, item->d, item->h, item->m, item->s, item->max_rms);
                     UART_Log("%s", msg);
                 }
             }
 
-            if(last.intensity > 1.0f && last.intensity < 20000.0f && last.hour < 24) {
-            	sprintf(msg,
-            	 "💾 DERNIER SEISME (FRAM) : 20%02d-%02d-%02d %02d:%02d:%02d (Force: %.0f)\r\n",
-            	 last.year, last.month, last.day,
-            	 last.hour, last.min, last.sec,
-            	 last.intensity);
+            // 2. VOISINS
+            UART_Log("\r\n📂 --- HISTORIQUE FRAM VOISINS ---\r\n");
+            NeighborEvent evt_read;
 
-            } else {
-                sprintf(msg, "💾 Pas de seisme valide en memoire FRAM.\r\n");
+            for (int slot = 0; slot < MAX_TRACKED_NEIGHBORS; slot++)
+            {
+                // Vérif si le slot est utilisé
+                if (neighbor_ip_map[slot] == 0) continue; // On saute les vides
+
+                UART_Log("\r\n📡 --- VOISIN SLOT %d (IP .%d) ---\r\n", slot, neighbor_ip_map[slot]);
+
+                for (int evt_idx = 0; evt_idx < HISTORY_DEPTH; evt_idx++)
+                {
+                    uint32_t read_addr = FRAM_NEIGHBOR_BASE_ADDR + (slot * FRAM_NEIGHBOR_BLOCK_SIZE) + (evt_idx * sizeof(NeighborEvent));
+                    FRAM_Read(read_addr, (uint8_t*)&evt_read, sizeof(evt_read));
+
+                    if (evt_read.day > 0 && evt_read.day <= 31)
+                    {
+                        sprintf(msg, "   [%d] 20%02d-%02d-%02d %02d:%02d:%02d | Force: %.2f V\r\n",
+                                evt_idx, evt_read.year, evt_read.month, evt_read.day,
+                                evt_read.hour, evt_read.min, evt_read.sec, evt_read.intensity);
+                        UART_Log("%s", msg);
+                    }
+                }
             }
-            UART_Log("%s", msg);
-            //presence_listener_init();
-            osThreadResume(heartBeatTaskHandle);
-            osThreadResume(presenceTaskHandle);
-            //osThreadResume(logMessageTaskHandle);
-            osThreadResume(seismicTaskHandle);
-            osThreadResume(clientTaskHandle);
-
-          } else {
-            system_running = 0;
-            UART_Log("\r\n>>> SYSTEM STOPPED <<<\r\n");
-
-            // 💡 AFFICHAGE PREUVE MEMORISATION RAM
-            UART_Log("\r\n📊 HISTORIQUE VOISINS (RAM):\r\n");
-            for(int i=0; i<10; i++) {
-                sprintf(msg, "   [%d] Force recue: %.2f\r\n", i, neighbor_peaks[i]);
-                UART_Log("%s", msg);
-            }
-
-            UART_Log("\r\n📊 HISTORIQUE LOCAL (RAM):\r\n");
-            for(int i=0; i<10; i++) {
-                sprintf(msg, "   [%d] Force locale: %.2f\r\n", i, local_peaks[i]);
-                UART_Log("%s", msg);
-            }
-
-            UART_Log("--------------------------\r\n");
+            UART_Log("----------------------------------------------------\r\n");
 
             osThreadSuspend(heartBeatTaskHandle);
             osThreadSuspend(presenceTaskHandle);
-            //osThreadSuspend(logMessageTaskHandle);
             osThreadSuspend(seismicTaskHandle);
             osThreadSuspend(clientTaskHandle);
-          }
         }
-        osDelay(100);
-    }
-
+      }
+      osDelay(100);
+  }
   /* USER CODE END 5 */
 }
 
@@ -2502,6 +2610,7 @@ void StartClientTask(void const * argument)
 
 	    for (;;)
 	    {
+
 	        // 1. On copie la liste localement pour ne pas bloquer le Mutex trop longtemps
 	        ip_addr_t targets[MAX_NEIGHBORS];
 	        int target_count = 0;
