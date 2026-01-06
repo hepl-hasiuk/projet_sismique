@@ -252,7 +252,7 @@ uint8_t local_hist_idx = 0;
 // Index d'écriture pour chaque slot (5 slots maintenant)
 uint8_t neighbor_fram_idx[MAX_TRACKED_NEIGHBORS] = {0};
 
-// MAPPING : Qui est dans quel slot ? (RAM)
+// MAPPING : Qui est dans quel slot ? (FRAM)
 // ip_map[0] = 190 veut dire que le slot FRAM 0 appartient à l'IP finissant par .190
 // 0 = vide (on suppose que personne n'a l'IP .0)
 uint8_t neighbor_ip_map[MAX_TRACKED_NEIGHBORS] = {0};
@@ -2515,7 +2515,7 @@ void StartDefaultTask(void const * argument)
             UART_Log("\r\n>>> SYSTEM STOPPED (PAUSE) <<<\r\n");
 
             // 1. LOCAL
-            UART_Log("\r\n📊 --- 10 VALEURS LOCALES (RAM) ---\r\n");
+            UART_Log("\r\n📊 --- 10 VALEURS LOCALES (FRAM) ---\r\n");
             UART_Log("Idx | Date       Heure    | Intensite\r\n");
             for(int i=0; i<HISTORY_DEPTH; i++) {
                 LocalHistoryItem *item = &local_history[i];
